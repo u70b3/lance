@@ -491,6 +491,29 @@ message ByteStreamSplit {
   CompressiveEncoding values = 1;
 }
 
+// Delta+RLE cascading compression
+//
+// Combines delta encoding (first-order differences) with RLE compression.
+// Optimized for monotonic data like timestamps and auto-increment IDs.
+//
+// Encoding process:
+// 1. Delta: [v0, v1, v2, v3] -> [v0, v1-v0, v2-v1, v3-v2]
+// 2. RLE: Compress repeated delta values
+//
+// For decoding, we reconstruct using prefix sums starting from first_value.
+message DeltaRle {
+    // Number of bits per uncompressed value (8, 16, 32, or 64)
+    uint64 uncompressed_bits_per_value = 1;
+    // First original value (stored separately for reconstruction)
+    int64 first_value = 2;
+    // Inner encoding for RLE values (typically FLAT i64)
+    CompressiveEncoding value_encoding = 3;
+    // Inner encoding for RLE lengths (typically FLAT u8)
+    CompressiveEncoding length_encoding = 4;
+    // Optional additional compression
+    optional BufferCompression compression = 5;
+}
+
 // An encoding that compresses a data block into buffers
 message CompressiveEncoding {
     oneof compression {
@@ -507,5 +530,6 @@ message CompressiveEncoding {
         FixedSizeList fixed_size_list = 11;
         PackedStruct packed_struct = 12;
         VariablePackedStruct variable_packed_struct = 13;
+        DeltaRle delta_rle = 15;
     }
 }

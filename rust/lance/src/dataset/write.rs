@@ -298,6 +298,13 @@ pub struct WriteParams {
 
     /// The strategy used when writing external blob URIs.
     pub external_blob_mode: ExternalBlobMode,
+
+    /// Compression parameters for the write operation.
+    ///
+    /// These parameters control per-column and per-type compression strategies
+    /// such as RLE threshold, general compression scheme, byte stream split,
+    /// and delta+RLE encoding.
+    pub compression_params: Option<lance_encoding::compression_config::CompressionParams>,
 }
 
 impl Default for WriteParams {
@@ -325,6 +332,7 @@ impl Default for WriteParams {
             target_base_names_or_paths: None,
             allow_external_blob_outside_bases: false,
             external_blob_mode: ExternalBlobMode::Reference,
+            compression_params: None,
         }
     }
 }
@@ -491,6 +499,7 @@ pub async fn do_write_fragments(
         params.external_blob_mode,
         source_store_registry,
         source_store_params,
+        params.compression_params.clone(),
     );
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
@@ -999,6 +1008,7 @@ struct WriterOptions {
     external_blob_mode: ExternalBlobMode,
     source_store_registry: Arc<ObjectStoreRegistry>,
     source_store_params: ObjectStoreParams,
+    compression_params: Option<lance_encoding::compression_config::CompressionParams>,
 }
 
 async fn open_writer_with_options(
@@ -1016,6 +1026,7 @@ async fn open_writer_with_options(
         external_blob_mode,
         source_store_registry,
         source_store_params,
+        compression_params,
     } = options;
 
     let data_file_key = generate_random_filename();
@@ -1044,11 +1055,20 @@ async fn open_writer_with_options(
     } else {
         let writer = object_store.create(&full_path).await?;
         let enable_blob_v2 = storage_version >= LanceFileVersion::V2_2;
+        let encoding_strategy = if let Some(params) = compression_params {
+            Some(
+                lance_encoding::encoder::default_encoding_strategy_with_params(storage_version, params)
+                    .map(|s| Arc::from(s))?,
+            )
+        } else {
+            None
+        };
         let file_writer = current_writer::FileWriter::try_new(
             writer,
             schema.clone(),
             FileWriterOptions {
                 format_version: Some(storage_version),
+                encoding_strategy,
                 ..Default::default()
             },
         )?;
@@ -1105,6 +1125,7 @@ struct WriterGenerator {
     external_blob_mode: ExternalBlobMode,
     source_store_registry: Arc<ObjectStoreRegistry>,
     source_store_params: ObjectStoreParams,
+    compression_params: Option<lance_encoding::compression_config::CompressionParams>,
     /// Counter for round-robin selection
     next_base_index: AtomicUsize,
 }
@@ -1122,6 +1143,7 @@ impl WriterGenerator {
         external_blob_mode: ExternalBlobMode,
         source_store_registry: Arc<ObjectStoreRegistry>,
         source_store_params: ObjectStoreParams,
+        compression_params: Option<lance_encoding::compression_config::CompressionParams>,
     ) -> Self {
         Self {
             object_store,
@@ -1134,6 +1156,7 @@ impl WriterGenerator {
             external_blob_mode,
             source_store_registry,
             source_store_params,
+            compression_params,
             next_base_index: AtomicUsize::new(0),
         }
     }
@@ -1167,6 +1190,7 @@ impl WriterGenerator {
                     external_blob_mode: self.external_blob_mode,
                     source_store_registry: self.source_store_registry.clone(),
                     source_store_params: self.source_store_params.clone(),
+                    compression_params: self.compression_params.clone(),
                 },
             )
             .await?
@@ -1184,6 +1208,7 @@ impl WriterGenerator {
                     external_blob_mode: self.external_blob_mode,
                     source_store_registry: self.source_store_registry.clone(),
                     source_store_params: self.source_store_params.clone(),
+                    compression_params: self.compression_params.clone(),
                 },
             )
             .await?
@@ -1820,6 +1845,7 @@ mod tests {
             ExternalBlobMode::Reference,
             Arc::new(ObjectStoreRegistry::default()),
             ObjectStoreParams::default(),
+            None,
         );
 
         // Create a writer
@@ -1937,6 +1963,7 @@ mod tests {
             ExternalBlobMode::Reference,
             Arc::new(ObjectStoreRegistry::default()),
             ObjectStoreParams::default(),
+            None,
         );
 
         // Create test batch

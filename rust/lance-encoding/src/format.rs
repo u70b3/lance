@@ -446,6 +446,27 @@ macro_rules! impl_common_protobuf_utils {
                 }
             }
 
+            pub fn delta_rle(
+                uncompressed_bits_per_value: u64,
+                first_value: i64,
+                values: crate::format::$module::CompressiveEncoding,
+                run_lengths: crate::format::$module::CompressiveEncoding,
+            ) -> crate::format::$module::CompressiveEncoding {
+                crate::format::$module::CompressiveEncoding {
+                    compression: Some(
+                        crate::format::$module::compressive_encoding::Compression::DeltaRle(
+                            Box::new(crate::format::$module::DeltaRle {
+                                uncompressed_bits_per_value,
+                                first_value,
+                                value_encoding: Some(Box::new(values)),
+                                length_encoding: Some(Box::new(run_lengths)),
+                                compression: None,
+                            }),
+                        ),
+                    ),
+                }
+            }
+
             pub fn byte_stream_split(
                 values: crate::format::$module::CompressiveEncoding,
             ) -> crate::format::$module::CompressiveEncoding {

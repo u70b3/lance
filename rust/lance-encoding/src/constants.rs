@@ -61,3 +61,7 @@ pub const STRUCTURAL_ENCODING_FULLZIP: &str = "fullzip";
 pub const BSS_META_KEY: &str = "lance-encoding:bss";
 /// Default BSS mode
 pub const DEFAULT_BSS_MODE: &str = "auto";
+
+// Delta+RLE metadata keys
+/// Metadata key for enabling/disabling delta+rle encoding
+pub const DELTA_RLE_META_KEY: &str = "lance-encoding:delta-rle";

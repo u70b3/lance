@@ -22,7 +22,8 @@ use crate::{
     buffer::LanceBuffer,
     compression_config::{BssMode, CompressionFieldParams, CompressionParams},
     constants::{
-        BSS_META_KEY, COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, RLE_THRESHOLD_META_KEY,
+        BSS_META_KEY, COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY,
+        DELTA_RLE_META_KEY, RLE_THRESHOLD_META_KEY,
     },
     data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock},
     encodings::{
@@ -40,6 +41,7 @@ use crate::{
                 ByteStreamSplitDecompressor, ByteStreamSplitEncoder, should_use_bss,
             },
             constant::ConstantDecompressor,
+            delta_rle::{DeltaRleDecompressor, DeltaRleEncoder, should_use_delta_rle},
             fsst::{
                 FsstMiniBlockDecompressor, FsstMiniBlockEncoder, FsstPerValueDecompressor,
                 FsstPerValueEncoder,
@@ -162,6 +164,31 @@ fn try_bss_for_mini_block(
     None
 }
 
+/// Try Delta+RLE cascading compression for monotonic data
+///
+/// Delta+RLE works best for time-series data, auto-increment IDs, and sorted sequences
+/// where delta values are constant or slowly changing.
+fn try_delta_rle_for_mini_block(
+    data: &FixedWidthDataBlock,
+    version: LanceFileVersion,
+    params: &CompressionFieldParams,
+) -> Option<Box<dyn MiniBlockCompressor>> {
+    if version < LanceFileVersion::V2_2 {
+        return None;
+    }
+    // Check if user explicitly disabled delta-rle
+    if params.delta_rle == Some(false) {
+        return None;
+    }
+
+    // Only try Delta+RLE for suitable data
+    if should_use_delta_rle(data).is_some() {
+        return Some(Box::new(DeltaRleEncoder::new()));
+    }
+
+    None
+}
+
 fn try_rle_for_mini_block(
     data: &FixedWidthDataBlock,
     params: &CompressionFieldParams,
@@ -237,6 +264,40 @@ fn try_rle_for_block(
         let encoding = ProtobufUtils21::rle(
             ProtobufUtils21::flat(bits, None),
             ProtobufUtils21::flat(/*bits_per_value=*/ 8, None),
+        );
+        return Some((compressor, encoding));
+    }
+    None
+}
+
+fn try_delta_rle_for_block(
+    data: &FixedWidthDataBlock,
+    version: LanceFileVersion,
+    params: &CompressionFieldParams,
+) -> Option<(Box<dyn BlockCompressor>, CompressiveEncoding)> {
+    if version < LanceFileVersion::V2_2 {
+        return None;
+    }
+    if params.delta_rle == Some(false) {
+        return None;
+    }
+
+    let bits = data.bits_per_value;
+    if !matches!(bits, 8 | 16 | 32 | 64) {
+        return None;
+    }
+
+    if should_use_delta_rle(data).is_some() {
+        let bytes_per_value = (bits / 8) as usize;
+        let mut bytes = [0u8; 8];
+        bytes[..bytes_per_value].copy_from_slice(&data.data.as_ref()[..bytes_per_value]);
+        let first_value = u64::from_le_bytes(bytes) as i64;
+        let compressor = Box::new(DeltaRleEncoder::new());
+        let encoding = ProtobufUtils21::delta_rle(
+            bits,
+            first_value,
+            ProtobufUtils21::flat(bits, None),
+            ProtobufUtils21::flat(8, None),
         );
         return Some((compressor, encoding));
     }
@@ -423,6 +484,15 @@ impl DefaultCompressionStrategy {
             }
         }
 
+        // Parse Delta+RLE mode
+        if let Some(delta_rle_str) = field.metadata.get(DELTA_RLE_META_KEY) {
+            if let Ok(v) = delta_rle_str.parse::<bool>() {
+                params.delta_rle = Some(v);
+            } else {
+                log::warn!("Invalid delta-rle mode '{}', using default", delta_rle_str);
+            }
+        }
+
         // Parse minichunk size
         if let Some(minichunk_size_str) = field
             .metadata
@@ -457,6 +527,7 @@ impl DefaultCompressionStrategy {
         }
 
         let base = try_bss_for_mini_block(data, params)
+            .or_else(|| try_delta_rle_for_mini_block(data, self.version, params))
             .or_else(|| try_rle_for_mini_block(data, params))
             .or_else(|| try_bitpack_for_mini_block(data))
             .unwrap_or_else(|| Box::new(ValueEncoder::default()));
@@ -665,6 +736,11 @@ impl CompressionStrategy for DefaultCompressionStrategy {
         match data {
             DataBlock::FixedWidth(fixed_width) => {
                 if let Some((compressor, encoding)) =
+                    try_delta_rle_for_block(fixed_width, self.version, &field_params)
+                {
+                    return Ok((compressor, encoding));
+                }
+                if let Some((compressor, encoding)) =
                     try_rle_for_block(fixed_width, self.version, &field_params)
                 {
                     return Ok((compressor, encoding));
@@ -818,6 +894,12 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             Compression::Rle(rle) => {
                 let bits_per_value = validate_rle_compression(rle)?;
                 Ok(Box::new(RleDecompressor::new(bits_per_value)))
+            }
+            Compression::DeltaRle(delta_rle) => {
+                Ok(Box::new(DeltaRleDecompressor::new(
+                    delta_rle.uncompressed_bits_per_value,
+                    delta_rle.first_value,
+                )))
             }
             Compression::ByteStreamSplit(bss) => {
                 let Compression::Flat(values) =
@@ -1008,6 +1090,12 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             Compression::Rle(rle) => {
                 let bits_per_value = validate_rle_compression(rle)?;
                 Ok(Box::new(RleDecompressor::new(bits_per_value)))
+            }
+            Compression::DeltaRle(delta_rle) => {
+                Ok(Box::new(DeltaRleDecompressor::new(
+                    delta_rle.uncompressed_bits_per_value,
+                    delta_rle.first_value,
+                )))
             }
             _ => todo!(),
         }
@@ -1218,6 +1306,7 @@ mod tests {
                 compression_level: None,
                 bss: Some(BssMode::Off), // Explicitly disable BSS to test RLE
                 minichunk_size: None,
+                delta_rle: None,
             },
         );
 
@@ -1250,6 +1339,7 @@ mod tests {
                 compression_level: Some(3),
                 bss: Some(BssMode::Off), // Disable BSS to test RLE
                 minichunk_size: None,
+                delta_rle: None,
             },
         );
 
@@ -1501,6 +1591,7 @@ mod tests {
                 compression_level: Some(6),
                 bss: None,
                 minichunk_size: None,
+                delta_rle: None,
             },
         );
 
@@ -1586,7 +1677,11 @@ mod tests {
         let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
         // Should use default strategy's decision
         let debug_str = format!("{:?}", compressor);
-        assert!(debug_str.contains("ValueEncoder") || debug_str.contains("InlineBitpacking"));
+        assert!(
+            debug_str.contains("ValueEncoder")
+                || debug_str.contains("InlineBitpacking")
+                || debug_str.contains("DeltaRleEncoder")
+        );
     }
 
     #[test]
@@ -1644,6 +1739,7 @@ mod tests {
                 compression_level: None,
                 bss: None,
                 minichunk_size: None,
+                delta_rle: None,
             },
         );
 

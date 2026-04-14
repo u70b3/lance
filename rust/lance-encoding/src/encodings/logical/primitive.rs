@@ -1356,6 +1356,8 @@ impl MiniBlockScheduler {
                 Compression::InlineBitpacking(_) | Compression::OutOfLineBitpacking(_) => {
                     crate::encoder::MIN_PAGE_BUFFER_ALIGNMENT
                 }
+                Compression::Rle(_) => crate::encoder::MIN_PAGE_BUFFER_ALIGNMENT,
+                Compression::DeltaRle(delta_rle) => delta_rle.uncompressed_bits_per_value / 8,
                 _ => {
                     return Err(Error::invalid_input_source(
                         format!(

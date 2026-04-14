@@ -3371,6 +3371,74 @@ fn get_dict_opt<'a, 'py, D: FromPyObject<'a>>(
         .transpose()
 }
 
+fn parse_compression_params(_py: Python, dict: &Bound<'_, PyDict>) -> PyResult<lance_encoding::compression_config::CompressionParams> {
+    use lance_encoding::compression_config::{BssMode, CompressionFieldParams, CompressionParams};
+    let mut params = CompressionParams::new();
+
+    fn parse_field_params(field_dict: &Bound<'_, PyDict>) -> PyResult<CompressionFieldParams> {
+        let mut fp = CompressionFieldParams::default();
+        if let Some(v) = field_dict.get_item("rle_threshold")? {
+            if !v.is_none() {
+                fp.rle_threshold = Some(v.extract::<f64>()?);
+            }
+        }
+        if let Some(v) = field_dict.get_item("compression")? {
+            if !v.is_none() {
+                fp.compression = Some(v.extract::<String>()?);
+            }
+        }
+        if let Some(v) = field_dict.get_item("compression_level")? {
+            if !v.is_none() {
+                fp.compression_level = Some(v.extract::<i32>()?);
+            }
+        }
+        if let Some(v) = field_dict.get_item("bss")? {
+            if !v.is_none() {
+                let s = v.extract::<String>()?;
+                fp.bss = Some(
+                    BssMode::parse(&s)
+                        .ok_or_else(|| PyValueError::new_err(format!("Invalid bss mode: {}", s)))?,
+                );
+            }
+        }
+        if let Some(v) = field_dict.get_item("minichunk_size")? {
+            if !v.is_none() {
+                fp.minichunk_size = Some(v.extract::<i64>()?);
+            }
+        }
+        if let Some(v) = field_dict.get_item("delta_rle")? {
+            if !v.is_none() {
+                fp.delta_rle = Some(v.extract::<bool>()?);
+            }
+        }
+        Ok(fp)
+    }
+
+    if let Some(columns) = dict.get_item("columns")? {
+        if !columns.is_none() {
+            let columns_dict = columns.downcast::<PyDict>()?;
+            for (key, value) in columns_dict.iter() {
+                let key = key.extract::<String>()?;
+                let value = value.downcast::<PyDict>()?;
+                params.columns.insert(key, parse_field_params(value)?);
+            }
+        }
+    }
+
+    if let Some(types) = dict.get_item("types")? {
+        if !types.is_none() {
+            let types_dict = types.downcast::<PyDict>()?;
+            for (key, value) in types_dict.iter() {
+                let key = key.extract::<String>()?;
+                let value = value.downcast::<PyDict>()?;
+                params.types.insert(key, parse_field_params(value)?);
+            }
+        }
+    }
+
+    Ok(params)
+}
+
 #[allow(deprecated)]
 pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WriteParams>> {
     let params = if options.is_none() {
@@ -3499,6 +3567,13 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             p = p.with_external_blob_mode(
                 ExternalBlobMode::try_from(external_blob_mode.as_str()).infer_error()?,
             );
+        }
+
+        if let Some(compression_params) = get_dict_opt::<Bound<PyAny>>(options, "compression_params")? {
+            if !compression_params.is_none() {
+                let compression_dict = compression_params.downcast::<PyDict>()?;
+                p.compression_params = Some(parse_compression_params(options.py(), compression_dict)?);
+            }
         }
 
         // Handle properties

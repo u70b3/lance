@@ -539,6 +539,7 @@ fn tag(e: &Compression) -> &'static str {
         Fsst(_) => "fsst",
         Dictionary(_) => "dictionary",
         Rle(_) => "rle",
+        DeltaRle(_) => "delta_rle",
         ByteStreamSplit(_) => "byte_stream_split",
         General(_) => "general",
         FixedSizeList(_) => "fixed_size_list",

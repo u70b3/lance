@@ -70,6 +70,9 @@ pub struct CompressionFieldParams {
 
     /// Minichunk size threshold for encoding
     pub minichunk_size: Option<i64>,
+
+    /// Delta+RLE encoding: if true, enable delta+RLE cascade compression for monotonic data
+    pub delta_rle: Option<bool>,
 }
 
 impl CompressionParams {
@@ -137,6 +140,9 @@ impl CompressionFieldParams {
         if other.minichunk_size.is_some() {
             self.minichunk_size = other.minichunk_size;
         }
+        if other.delta_rle.is_some() {
+            self.delta_rle = other.delta_rle;
+        }
     }
 }
 
@@ -197,6 +203,7 @@ mod tests {
         assert_eq!(params.compression, None);
         assert_eq!(params.compression_level, None);
         assert_eq!(params.bss, None);
+        assert_eq!(params.delta_rle, None);
 
         let other = CompressionFieldParams {
             rle_threshold: Some(0.3),
@@ -204,6 +211,7 @@ mod tests {
             compression_level: None,
             bss: Some(BssMode::On),
             minichunk_size: None,
+            delta_rle: Some(true),
         };
 
         params.merge(&other);
@@ -211,6 +219,7 @@ mod tests {
         assert_eq!(params.compression, Some("lz4".to_string()));
         assert_eq!(params.compression_level, None);
         assert_eq!(params.bss, Some(BssMode::On));
+        assert_eq!(params.delta_rle, Some(true));
 
         let another = CompressionFieldParams {
             rle_threshold: None,
@@ -218,6 +227,7 @@ mod tests {
             compression_level: Some(3),
             bss: Some(BssMode::Auto),
             minichunk_size: None,
+            delta_rle: None,
         };
 
         params.merge(&another);
@@ -225,6 +235,7 @@ mod tests {
         assert_eq!(params.compression, Some("zstd".to_string())); // Overridden
         assert_eq!(params.compression_level, Some(3)); // New value
         assert_eq!(params.bss, Some(BssMode::Auto)); // Overridden
+        assert_eq!(params.delta_rle, Some(true)); // Not overridden
     }
 
     #[test]
@@ -250,6 +261,7 @@ mod tests {
                 compression_level: Some(3),
                 bss: None,
                 minichunk_size: None,
+                delta_rle: None,
             },
         );
 

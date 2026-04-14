@@ -592,6 +592,7 @@ mod test {
         // Explicitly disable BSS to ensure bitpacking is tested
         let mut metadata = HashMap::new();
         metadata.insert("lance-encoding:bss".to_string(), "off".to_string());
+        metadata.insert("lance-encoding:delta-rle".to_string(), "false".to_string());
 
         check_round_trip_encoding_of_data(arrays, &test_cases, metadata.clone()).await;
     }

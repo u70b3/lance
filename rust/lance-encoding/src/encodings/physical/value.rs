@@ -1166,6 +1166,7 @@ mod tests {
         let mut metadata_explicit = HashMap::new();
         metadata_explicit.insert("lance-encoding:compression".to_string(), "none".to_string());
         metadata_explicit.insert("lance-encoding:bss".to_string(), "off".to_string());
+        metadata_explicit.insert("lance-encoding:delta-rle".to_string(), "false".to_string());
 
         let arr_explicit =
             Arc::new(Int32Array::from((0..1000).collect::<Vec<i32>>())) as Arc<dyn Array>;
@@ -1176,6 +1177,7 @@ mod tests {
         // Explicitly disable BSS to ensure value encoding is tested
         let mut metadata = HashMap::new();
         metadata.insert("lance-encoding:bss".to_string(), "off".to_string());
+        metadata.insert("lance-encoding:delta-rle".to_string(), "false".to_string());
 
         let arr_fallback = Arc::new(Int32Array::from(
             (0..100).map(|i| i * 73 + 19).collect::<Vec<i32>>(),

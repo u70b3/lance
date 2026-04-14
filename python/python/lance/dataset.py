@@ -5962,6 +5962,7 @@ def write_dataset(
     target_bases: Optional[List[str]] = None,
     external_blob_mode: Literal["reference", "ingest"] = "reference",
     allow_external_blob_outside_bases: bool = False,
+    compression_params: Optional[Dict[str, Dict[str, Any]]] = None,
     namespace_client: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
 ) -> LanceDataset:
@@ -6067,6 +6068,20 @@ def write_dataset(
         If False, external blob URIs must map to the dataset root or a registered
         base path. If True, external blob URIs outside registered bases are allowed.
         This option only applies when ``external_blob_mode="reference"``.
+    compression_params: dict, optional
+        Compression configuration for the write operation. The dict should have
+        optional keys ``columns`` and/or ``types``, each mapping to a dict of
+        field names or type strings to parameter dicts. Supported parameters
+        per field include:
+
+        - ``rle_threshold`` (float): threshold for RLE compression selection
+        - ``compression`` (str): general compression scheme ("lz4", "zstd", "none")
+        - ``compression_level`` (int): compression level for zstd
+        - ``bss`` (str): byte stream split mode ("off", "on", "auto")
+        - ``minichunk_size`` (int): minichunk size threshold
+        - ``delta_rle`` (bool): enable delta+RLE cascade compression
+
+        Example: ``{"columns": {"ts": {"delta_rle": True}}}``
     namespace_client : optional, LanceNamespace
         A namespace client from which to fetch table location and storage options.
         Must be provided together with `table_id`. Cannot be used with `uri`.
@@ -6195,6 +6210,7 @@ def write_dataset(
         "target_bases": target_bases,
         "external_blob_mode": external_blob_mode,
         "allow_external_blob_outside_bases": allow_external_blob_outside_bases,
+        "compression_params": compression_params,
     }
 
     # Add namespace_client and table_id for storage options provider and managed

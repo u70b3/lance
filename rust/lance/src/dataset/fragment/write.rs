@@ -8,10 +8,12 @@ use lance_core::Error;
 use lance_core::datatypes::Schema;
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::StreamingWriteSource;
+use lance_encoding::encoder::FieldEncodingStrategy;
 use lance_file::previous::writer::FileWriter as PreviousFileWriter;
 use lance_file::version::LanceFileVersion;
 use lance_file::writer::FileWriterOptions;
 use lance_io::object_store::ObjectStore;
+use std::sync::Arc;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::io::manifest::ManifestDescribing;
 use std::borrow::Cow;
@@ -138,11 +140,24 @@ impl<'a> FragmentCreateBuilder<'a> {
         let mut fragment = Fragment::new(id);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
         let obj_writer = object_store.create(&full_path).await?;
+        let storage_version = params
+            .data_storage_version
+            .unwrap_or(LanceFileVersion::default());
+        let encoding_strategy = params.compression_params.clone().map(|params| {
+            lance_encoding::encoder::default_encoding_strategy_with_params(storage_version, params)
+                .map(|s| Arc::from(s) as Arc<dyn FieldEncodingStrategy>)
+        });
+        let encoding_strategy = match encoding_strategy {
+            Some(Ok(strategy)) => Some(strategy),
+            Some(Err(e)) => return Err(e),
+            None => None,
+        };
         let mut writer = lance_file::writer::FileWriter::try_new(
             obj_writer,
             schema,
             FileWriterOptions {
                 format_version: params.data_storage_version,
+                encoding_strategy,
                 ..Default::default()
             },
         )?;

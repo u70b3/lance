@@ -783,6 +783,7 @@ mod tests {
                 compression_level: None,
                 bss: None,
                 minichunk_size: None,
+                delta_rle: None,
             },
         );
 

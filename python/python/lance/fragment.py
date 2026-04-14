@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
+    Any,
     Callable,
     Dict,
     Iterator,
@@ -904,6 +905,7 @@ if TYPE_CHECKING:
         enable_stable_row_ids: bool = False,
         target_bases: Optional[List[str]] = None,
         initial_bases: Optional[List["DatasetBasePath"]] = None,
+        compression_params: Optional[Dict[str, Dict[str, Any]]] = None,
         namespace_client: Optional[LanceNamespace] = None,
         table_id: Optional[List[str]] = None,
     ) -> Transaction: ...
@@ -926,6 +928,7 @@ if TYPE_CHECKING:
         enable_stable_row_ids: bool = False,
         target_bases: Optional[List[str]] = None,
         initial_bases: Optional[List["DatasetBasePath"]] = None,
+        compression_params: Optional[Dict[str, Dict[str, Any]]] = None,
         namespace_client: Optional[LanceNamespace] = None,
         table_id: Optional[List[str]] = None,
     ) -> List[FragmentMetadata]: ...
@@ -948,6 +951,7 @@ def write_fragments(
     enable_stable_row_ids: bool = False,
     target_bases: Optional[List[str]] = None,
     initial_bases: Optional[List["DatasetBasePath"]] = None,
+    compression_params: Optional[Dict[str, Dict[str, Any]]] = None,
     namespace_client: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
 ) -> List[FragmentMetadata] | Transaction:
@@ -1097,6 +1101,7 @@ def write_fragments(
         enable_stable_row_ids=enable_stable_row_ids,
         target_bases=target_bases,
         initial_bases=initial_bases,
+        compression_params=compression_params,
     )
 
 

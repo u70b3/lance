@@ -108,6 +108,33 @@ def test_dataset_overwrite(tmp_path: Path):
     assert ds_v1.to_table() == table1
 
 
+def test_write_dataset_compression_params(tmp_path: Path):
+    table = pa.table(
+        {
+            "id": pa.array(range(1000), pa.int64()),
+            "ts": pa.array(range(1000), pa.int64()),
+        }
+    )
+    base_dir = tmp_path / "test_compression"
+
+    # Write with delta_rle enabled via compression_params
+    ds = lance.write_dataset(
+        table,
+        base_dir,
+        data_storage_version="2.2",
+        compression_params={
+            "columns": {
+                "ts": {"delta_rle": True, "rle_threshold": 0.3},
+            },
+            "types": {
+                "Int64": {"bss": "auto"},
+            },
+        },
+    )
+    assert ds.count_rows() == 1000
+    assert ds.to_table() == table
+
+
 def test_truncate_table(tmp_path: Path):
     base_dir = tmp_path / "truncate"
     table = pa.table(
