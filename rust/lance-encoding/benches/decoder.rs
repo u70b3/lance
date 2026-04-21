@@ -75,6 +75,7 @@ fn bench_decode(c: &mut Criterion) {
                 .unwrap();
 
             b.iter(|| {
+            for _ in 0..10 {
                 let batch = rt
                     .block_on(lance_encoding::decoder::decode_batch(
                         &encoded,
@@ -86,6 +87,7 @@ fn bench_decode(c: &mut Criterion) {
                     ))
                     .unwrap();
                 assert_eq!(data.num_rows(), batch.num_rows());
+            }
             })
         });
     }
@@ -143,6 +145,7 @@ fn bench_decode_fsl(c: &mut Criterion) {
                             ))
                             .unwrap();
                         b.iter(|| {
+            for _ in 0..10 {
                             let batch = rt
                                 .block_on(lance_encoding::decoder::decode_batch(
                                     &encoded,
@@ -154,6 +157,7 @@ fn bench_decode_fsl(c: &mut Criterion) {
                                 ))
                                 .unwrap();
                             assert_eq!(data.num_rows(), batch.num_rows());
+            }
                         })
                     });
                 }
@@ -208,7 +212,9 @@ fn bench_decode_str_with_dict_encoding(c: &mut Criterion) {
                 &EncodingOptions::default(),
             ))
             .unwrap();
+
         b.iter(|| {
+            for _ in 0..10 {
             let batch = rt
                 .block_on(lance_encoding::decoder::decode_batch(
                     &encoded,
@@ -220,6 +226,7 @@ fn bench_decode_str_with_dict_encoding(c: &mut Criterion) {
                 ))
                 .unwrap();
             assert_eq!(data.num_rows(), batch.num_rows());
+            }
         })
     });
 }
@@ -285,6 +292,7 @@ fn bench_decode_packed_struct(c: &mut Criterion) {
             .unwrap();
 
         b.iter(|| {
+            for _ in 0..10 {
             let batch = rt
                 .block_on(lance_encoding::decoder::decode_batch(
                     &encoded,
@@ -296,6 +304,7 @@ fn bench_decode_packed_struct(c: &mut Criterion) {
                 ))
                 .unwrap();
             assert_eq!(data.num_rows(), batch.num_rows());
+            }
         })
     });
 }
@@ -341,6 +350,7 @@ fn bench_decode_str_with_fixed_size_binary_encoding(c: &mut Criterion) {
             ))
             .unwrap();
         b.iter(|| {
+            for _ in 0..10 {
             let batch = rt
                 .block_on(lance_encoding::decoder::decode_batch(
                     &encoded,
@@ -352,6 +362,7 @@ fn bench_decode_str_with_fixed_size_binary_encoding(c: &mut Criterion) {
                 ))
                 .unwrap();
             assert_eq!(data.num_rows(), batch.num_rows());
+            }
         })
     });
 }
@@ -417,17 +428,20 @@ fn bench_decode_compressed(c: &mut Criterion) {
             format!("{}_strings_{}cols", compression, NUM_COLUMNS),
             |b| {
                 b.iter(|| {
-                    let batch = rt
-                        .block_on(lance_encoding::decoder::decode_batch(
-                            &encoded,
-                            &FilterExpression::no_filter(),
-                            Arc::<DecoderPlugins>::default(),
-                            false,
-                            LanceFileVersion::V2_2,
-                            Some(Arc::new(LanceCache::no_cache())),
-                        ))
-                        .unwrap();
-                    assert_eq!(data.num_rows(), batch.num_rows());
+                    // Decode 10 times to dominate wall-clock time for perf profiling
+                    for _ in 0..10 {
+                        let batch = rt
+                            .block_on(lance_encoding::decoder::decode_batch(
+                                &encoded,
+                                &FilterExpression::no_filter(),
+                                Arc::<DecoderPlugins>::default(),
+                                false,
+                                LanceFileVersion::V2_2,
+                                Some(Arc::new(LanceCache::no_cache())),
+                            ))
+                            .unwrap();
+                        assert_eq!(data.num_rows(), batch.num_rows());
+                    }
                 })
             },
         );
@@ -562,6 +576,430 @@ fn bench_decode_compressed_parallel(c: &mut Criterion) {
     }
 }
 
+fn bench_decode_bitpacking(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut group = c.benchmark_group("decode_bitpacking");
+    const NUM_BYTES: u64 = 1024 * 1024 * 128;
+    const NUM_ROWS: u64 = NUM_BYTES / 4; // UInt32
+    group.throughput(criterion::Throughput::Bytes(NUM_BYTES));
+
+    // Generate small-range UInt32 data to trigger bitpacking
+    let values: Vec<u32> = (0..NUM_ROWS).map(|i| (i % 1000) as u32).collect();
+    let array: Arc<dyn arrow_array::Array> = Arc::new(arrow_array::UInt32Array::from(values));
+
+    // Bitpacking path: disable RLE and BSS to isolate bitpacking
+    // Do NOT set compression=none, or build_fixed_width_compressor will skip
+    // all encodings (including bitpacking) and return ValueEncoder directly.
+    let mut metadata_bp = HashMap::new();
+    metadata_bp.insert("lance-encoding:rle-threshold".to_string(), "0.0".to_string());
+    metadata_bp.insert("lance-encoding:bss".to_string(), "off".to_string());
+    metadata_bp.insert("lance-encoding:delta-rle".to_string(), "false".to_string());
+
+    let fields_bp = vec![Field::new("v", DataType::UInt32, false).with_metadata(metadata_bp)];
+    let schema_bp = Arc::new(Schema::new(fields_bp));
+    let data_bp = RecordBatch::try_new(schema_bp.clone(), vec![array.clone()]).unwrap();
+
+    let lance_schema_bp =
+        Arc::new(lance_core::datatypes::Schema::try_from(schema_bp.as_ref()).unwrap());
+    let encoded_bp = rt
+        .block_on(encode_batch(
+            &data_bp,
+            lance_schema_bp,
+            default_encoding_strategy(LanceFileVersion::V2_2).as_ref(),
+            &EncodingOptions::default(),
+        ))
+        .unwrap();
+
+    group.bench_function("bitpacking_uint32", |b| {
+        b.iter(|| {
+            for _ in 0..10 {
+                let batch = rt
+                    .block_on(lance_encoding::decoder::decode_batch(
+                        &encoded_bp,
+                        &FilterExpression::no_filter(),
+                        Arc::<DecoderPlugins>::default(),
+                        false,
+                        LanceFileVersion::V2_2,
+                        Some(Arc::new(LanceCache::no_cache())),
+                    ))
+                    .unwrap();
+                assert_eq!(data_bp.num_rows(), batch.num_rows());
+            }
+        })
+    });
+
+    // Flat/Value baseline: same data but force no compression/encoding
+    let mut metadata_flat = HashMap::new();
+    metadata_flat.insert("lance-encoding:compression".to_string(), "none".to_string());
+    metadata_flat.insert("lance-encoding:bss".to_string(), "off".to_string());
+    metadata_flat.insert("lance-encoding:delta-rle".to_string(), "false".to_string());
+    metadata_flat.insert("lance-encoding:rle-threshold".to_string(), "0.0".to_string());
+
+    let fields_flat = vec![Field::new("v", DataType::UInt32, false).with_metadata(metadata_flat)];
+    let schema_flat = Arc::new(Schema::new(fields_flat));
+    let data_flat = RecordBatch::try_new(schema_flat.clone(), vec![array.clone()]).unwrap();
+
+    let lance_schema_flat =
+        Arc::new(lance_core::datatypes::Schema::try_from(schema_flat.as_ref()).unwrap());
+    let encoded_flat = rt
+        .block_on(encode_batch(
+            &data_flat,
+            lance_schema_flat,
+            default_encoding_strategy(LanceFileVersion::V2_2).as_ref(),
+            &EncodingOptions::default(),
+        ))
+        .unwrap();
+
+    group.bench_function("flat_uint32", |b| {
+        b.iter(|| {
+            for _ in 0..10 {
+                let batch = rt
+                    .block_on(lance_encoding::decoder::decode_batch(
+                        &encoded_flat,
+                        &FilterExpression::no_filter(),
+                        Arc::<DecoderPlugins>::default(),
+                        false,
+                        LanceFileVersion::V2_2,
+                        Some(Arc::new(LanceCache::no_cache())),
+                    ))
+                    .unwrap();
+                assert_eq!(data_flat.num_rows(), batch.num_rows());
+            }
+        })
+    });
+
+    group.finish();
+}
+
+fn bench_decode_bss(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut group = c.benchmark_group("decode_bss");
+    const NUM_BYTES: u64 = 1024 * 1024 * 128;
+    const NUM_ROWS: u64 = NUM_BYTES / 4; // Float32
+    group.throughput(criterion::Throughput::Bytes(NUM_BYTES));
+
+    let values: Vec<f32> = (0..NUM_ROWS).map(|i| (i % 10000) as f32).collect();
+    let array: Arc<dyn arrow_array::Array> = Arc::new(arrow_array::Float32Array::from(values));
+
+    // BSS on (BSS requires general compression to be effective)
+    let mut metadata_bss = HashMap::new();
+    metadata_bss.insert("lance-encoding:bss".to_string(), "on".to_string());
+    metadata_bss.insert("lance-encoding:compression".to_string(), "zstd".to_string());
+    metadata_bss.insert("lance-encoding:delta-rle".to_string(), "false".to_string());
+
+    let fields_bss = vec![Field::new("v", DataType::Float32, false).with_metadata(metadata_bss)];
+    let schema_bss = Arc::new(Schema::new(fields_bss));
+    let data_bss = RecordBatch::try_new(schema_bss.clone(), vec![array.clone()]).unwrap();
+
+    let lance_schema_bss =
+        Arc::new(lance_core::datatypes::Schema::try_from(schema_bss.as_ref()).unwrap());
+    let encoded_bss = rt
+        .block_on(encode_batch(
+            &data_bss,
+            lance_schema_bss,
+            default_encoding_strategy(LanceFileVersion::V2_2).as_ref(),
+            &EncodingOptions::default(),
+        ))
+        .unwrap();
+
+    group.bench_function("bss_float32", |b| {
+        b.iter(|| {
+            for _ in 0..10 {
+            let batch = rt
+                .block_on(lance_encoding::decoder::decode_batch(
+                    &encoded_bss,
+                    &FilterExpression::no_filter(),
+                    Arc::<DecoderPlugins>::default(),
+                    false,
+                    LanceFileVersion::V2_2,
+                    Some(Arc::new(LanceCache::no_cache())),
+                ))
+                .unwrap();
+            assert_eq!(data_bss.num_rows(), batch.num_rows());
+            }
+        })
+    });
+
+    // BSS off baseline (same compression, no BSS)
+    let mut metadata_no_bss = HashMap::new();
+    metadata_no_bss.insert("lance-encoding:bss".to_string(), "off".to_string());
+    metadata_no_bss.insert("lance-encoding:compression".to_string(), "zstd".to_string());
+    metadata_no_bss.insert("lance-encoding:delta-rle".to_string(), "false".to_string());
+
+    let fields_no_bss =
+        vec![Field::new("v", DataType::Float32, false).with_metadata(metadata_no_bss)];
+    let schema_no_bss = Arc::new(Schema::new(fields_no_bss));
+    let data_no_bss = RecordBatch::try_new(schema_no_bss.clone(), vec![array.clone()]).unwrap();
+
+    let lance_schema_no_bss =
+        Arc::new(lance_core::datatypes::Schema::try_from(schema_no_bss.as_ref()).unwrap());
+    let encoded_no_bss = rt
+        .block_on(encode_batch(
+            &data_no_bss,
+            lance_schema_no_bss,
+            default_encoding_strategy(LanceFileVersion::V2_2).as_ref(),
+            &EncodingOptions::default(),
+        ))
+        .unwrap();
+
+    group.bench_function("no_bss_float32", |b| {
+        b.iter(|| {
+            for _ in 0..10 {
+            let batch = rt
+                .block_on(lance_encoding::decoder::decode_batch(
+                    &encoded_no_bss,
+                    &FilterExpression::no_filter(),
+                    Arc::<DecoderPlugins>::default(),
+                    false,
+                    LanceFileVersion::V2_2,
+                    Some(Arc::new(LanceCache::no_cache())),
+                ))
+                .unwrap();
+            assert_eq!(data_no_bss.num_rows(), batch.num_rows());
+            }
+        })
+    });
+
+    group.finish();
+}
+
+fn bench_decode_fsst(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut group = c.benchmark_group("decode_fsst");
+    const NUM_ROWS: usize = 5_000_000; // ~24 bytes per string = ~120MB
+    const NUM_BYTES: u64 = NUM_ROWS as u64 * 24;
+    group.throughput(criterion::Throughput::Bytes(NUM_BYTES));
+
+    // High-prefix-repeat strings ideal for FSST
+    let array: Arc<dyn arrow_array::Array> = Arc::new(arrow_array::StringArray::from_iter_values(
+        (0..NUM_ROWS).map(|i| format!("category_{}_item_{:08}", i % 10, i)),
+    ));
+
+    // FSST path
+    let mut metadata_fsst = HashMap::new();
+    metadata_fsst.insert("lance-encoding:compression".to_string(), "fsst".to_string());
+    metadata_fsst.insert("lance-encoding:dict-divisor".to_string(), "100000".to_string());
+    metadata_fsst.insert("lance-encoding:structural-encoding".to_string(), "miniblock".to_string());
+
+    let fields_fsst = vec![Field::new("s", DataType::Utf8, false).with_metadata(metadata_fsst)];
+    let schema_fsst = Arc::new(Schema::new(fields_fsst));
+    let data_fsst = RecordBatch::try_new(schema_fsst.clone(), vec![array.clone()]).unwrap();
+
+    let lance_schema_fsst =
+        Arc::new(lance_core::datatypes::Schema::try_from(schema_fsst.as_ref()).unwrap());
+    let encoded_fsst = rt
+        .block_on(encode_batch(
+            &data_fsst,
+            lance_schema_fsst,
+            default_encoding_strategy(LanceFileVersion::V2_2).as_ref(),
+            &EncodingOptions::default(),
+        ))
+        .unwrap();
+
+    group.bench_function("fsst_utf8", |b| {
+        b.iter(|| {
+            for _ in 0..10 {
+            let batch = rt
+                .block_on(lance_encoding::decoder::decode_batch(
+                    &encoded_fsst,
+                    &FilterExpression::no_filter(),
+                    Arc::<DecoderPlugins>::default(),
+                    false,
+                    LanceFileVersion::V2_2,
+                    Some(Arc::new(LanceCache::no_cache())),
+                ))
+                .unwrap();
+            assert_eq!(data_fsst.num_rows(), batch.num_rows());
+            }
+        })
+    });
+
+    // zstd baseline
+    let mut metadata_zstd = HashMap::new();
+    metadata_zstd.insert("lance-encoding:compression".to_string(), "zstd".to_string());
+    metadata_zstd.insert("lance-encoding:dict-divisor".to_string(), "100000".to_string());
+    metadata_zstd.insert(
+        "lance-encoding:structural-encoding".to_string(),
+        "miniblock".to_string(),
+    );
+
+    let fields_zstd = vec![Field::new("s", DataType::Utf8, false).with_metadata(metadata_zstd)];
+    let schema_zstd = Arc::new(Schema::new(fields_zstd));
+    let data_zstd = RecordBatch::try_new(schema_zstd.clone(), vec![array.clone()]).unwrap();
+
+    let lance_schema_zstd =
+        Arc::new(lance_core::datatypes::Schema::try_from(schema_zstd.as_ref()).unwrap());
+    let encoded_zstd = rt
+        .block_on(encode_batch(
+            &data_zstd,
+            lance_schema_zstd,
+            default_encoding_strategy(LanceFileVersion::V2_2).as_ref(),
+            &EncodingOptions::default(),
+        ))
+        .unwrap();
+
+    group.bench_function("zstd_utf8", |b| {
+        b.iter(|| {
+            for _ in 0..10 {
+            let batch = rt
+                .block_on(lance_encoding::decoder::decode_batch(
+                    &encoded_zstd,
+                    &FilterExpression::no_filter(),
+                    Arc::<DecoderPlugins>::default(),
+                    false,
+                    LanceFileVersion::V2_2,
+                    Some(Arc::new(LanceCache::no_cache())),
+                ))
+                .unwrap();
+            assert_eq!(data_zstd.num_rows(), batch.num_rows());
+            }
+        })
+    });
+
+    // flat baseline
+    let mut metadata_flat = HashMap::new();
+    metadata_flat.insert("lance-encoding:compression".to_string(), "none".to_string());
+    metadata_flat.insert("lance-encoding:dict-divisor".to_string(), "100000".to_string());
+    metadata_flat.insert(
+        "lance-encoding:structural-encoding".to_string(),
+        "miniblock".to_string(),
+    );
+
+    let fields_flat = vec![Field::new("s", DataType::Utf8, false).with_metadata(metadata_flat)];
+    let schema_flat = Arc::new(Schema::new(fields_flat));
+    let data_flat = RecordBatch::try_new(schema_flat.clone(), vec![array.clone()]).unwrap();
+
+    let lance_schema_flat =
+        Arc::new(lance_core::datatypes::Schema::try_from(schema_flat.as_ref()).unwrap());
+    let encoded_flat = rt
+        .block_on(encode_batch(
+            &data_flat,
+            lance_schema_flat,
+            default_encoding_strategy(LanceFileVersion::V2_2).as_ref(),
+            &EncodingOptions::default(),
+        ))
+        .unwrap();
+
+    group.bench_function("flat_utf8", |b| {
+        b.iter(|| {
+            for _ in 0..10 {
+            let batch = rt
+                .block_on(lance_encoding::decoder::decode_batch(
+                    &encoded_flat,
+                    &FilterExpression::no_filter(),
+                    Arc::<DecoderPlugins>::default(),
+                    false,
+                    LanceFileVersion::V2_2,
+                    Some(Arc::new(LanceCache::no_cache())),
+                ))
+                .unwrap();
+            assert_eq!(data_flat.num_rows(), batch.num_rows());
+            }
+        })
+    });
+
+    group.finish();
+}
+
+fn bench_decode_rle(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut group = c.benchmark_group("decode_rle");
+    const NUM_BYTES: u64 = 1024 * 1024 * 128;
+    const NUM_ROWS: u64 = NUM_BYTES / 4; // Int32
+    group.throughput(criterion::Throughput::Bytes(NUM_BYTES));
+
+    // Only 2 unique values with long runs to make RLE beat bitpacking:
+    // bitpacking with bit_width=1 needs ~4MB, but RLE only needs ~10 bytes.
+    let half = NUM_ROWS / 2;
+    let values: Vec<i32> = (0..NUM_ROWS)
+        .map(|i| if i < half { 0i32 } else { 1i32 })
+        .collect();
+    let array: Arc<dyn arrow_array::Array> = Arc::new(arrow_array::Int32Array::from(values));
+
+    // RLE path: high threshold to encourage RLE, disable other encodings
+    // Do NOT set compression=none, or build_fixed_width_compressor will skip
+    // all encodings (including RLE) and return ValueEncoder directly.
+    let mut metadata_rle = HashMap::new();
+    metadata_rle.insert("lance-encoding:rle-threshold".to_string(), "0.9".to_string());
+    metadata_rle.insert("lance-encoding:bss".to_string(), "off".to_string());
+    metadata_rle.insert("lance-encoding:delta-rle".to_string(), "false".to_string());
+
+    let fields_rle = vec![Field::new("v", DataType::Int32, false).with_metadata(metadata_rle)];
+    let schema_rle = Arc::new(Schema::new(fields_rle));
+    let data_rle = RecordBatch::try_new(schema_rle.clone(), vec![array.clone()]).unwrap();
+
+    let lance_schema_rle =
+        Arc::new(lance_core::datatypes::Schema::try_from(schema_rle.as_ref()).unwrap());
+    let encoded_rle = rt
+        .block_on(encode_batch(
+            &data_rle,
+            lance_schema_rle,
+            default_encoding_strategy(LanceFileVersion::V2_2).as_ref(),
+            &EncodingOptions::default(),
+        ))
+        .unwrap();
+
+    group.bench_function("rle_int32", |b| {
+        b.iter(|| {
+            for _ in 0..10 {
+            let batch = rt
+                .block_on(lance_encoding::decoder::decode_batch(
+                    &encoded_rle,
+                    &FilterExpression::no_filter(),
+                    Arc::<DecoderPlugins>::default(),
+                    false,
+                    LanceFileVersion::V2_2,
+                    Some(Arc::new(LanceCache::no_cache())),
+                ))
+                .unwrap();
+            assert_eq!(data_rle.num_rows(), batch.num_rows());
+            }
+        })
+    });
+
+    // Flat baseline: same data but force no encoding
+    let mut metadata_flat = HashMap::new();
+    metadata_flat.insert("lance-encoding:compression".to_string(), "none".to_string());
+    metadata_flat.insert("lance-encoding:bss".to_string(), "off".to_string());
+    metadata_flat.insert("lance-encoding:delta-rle".to_string(), "false".to_string());
+    metadata_flat.insert("lance-encoding:rle-threshold".to_string(), "0.0".to_string());
+
+    let fields_flat = vec![Field::new("v", DataType::Int32, false).with_metadata(metadata_flat)];
+    let schema_flat = Arc::new(Schema::new(fields_flat));
+    let data_flat = RecordBatch::try_new(schema_flat.clone(), vec![array.clone()]).unwrap();
+
+    let lance_schema_flat =
+        Arc::new(lance_core::datatypes::Schema::try_from(schema_flat.as_ref()).unwrap());
+    let encoded_flat = rt
+        .block_on(encode_batch(
+            &data_flat,
+            lance_schema_flat,
+            default_encoding_strategy(LanceFileVersion::V2_2).as_ref(),
+            &EncodingOptions::default(),
+        ))
+        .unwrap();
+
+    group.bench_function("flat_int32", |b| {
+        b.iter(|| {
+            for _ in 0..10 {
+            let batch = rt
+                .block_on(lance_encoding::decoder::decode_batch(
+                    &encoded_flat,
+                    &FilterExpression::no_filter(),
+                    Arc::<DecoderPlugins>::default(),
+                    false,
+                    LanceFileVersion::V2_2,
+                    Some(Arc::new(LanceCache::no_cache())),
+                ))
+                .unwrap();
+            assert_eq!(data_flat.num_rows(), batch.num_rows());
+            }
+        })
+    });
+
+    group.finish();
+}
+
 #[cfg(target_os = "linux")]
 criterion_group!(
     name=benches;
@@ -569,7 +1007,8 @@ criterion_group!(
         .with_profiler(pprof::criterion::PProfProfiler::new(100, pprof::criterion::Output::Flamegraph(None)));
     targets = bench_decode, bench_decode_fsl, bench_decode_str_with_dict_encoding, bench_decode_packed_struct,
                 bench_decode_str_with_fixed_size_binary_encoding, bench_decode_compressed,
-                bench_decode_compressed_parallel);
+                bench_decode_compressed_parallel, bench_decode_bitpacking, bench_decode_bss,
+                bench_decode_fsst, bench_decode_rle);
 
 // Non-linux version does not support pprof.
 #[cfg(not(target_os = "linux"))]
@@ -577,5 +1016,6 @@ criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
     targets = bench_decode, bench_decode_fsl, bench_decode_str_with_dict_encoding, bench_decode_packed_struct,
-                bench_decode_compressed, bench_decode_compressed_parallel);
+                bench_decode_compressed, bench_decode_compressed_parallel, bench_decode_bitpacking,
+                bench_decode_bss, bench_decode_fsst, bench_decode_rle);
 criterion_main!(benches);

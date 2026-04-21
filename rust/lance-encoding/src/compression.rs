@@ -172,6 +172,7 @@ fn try_delta_rle_for_mini_block(
     data: &FixedWidthDataBlock,
     version: LanceFileVersion,
     params: &CompressionFieldParams,
+    data_type: &DataType,
 ) -> Option<Box<dyn MiniBlockCompressor>> {
     if version < LanceFileVersion::V2_2 {
         return None;
@@ -182,7 +183,7 @@ fn try_delta_rle_for_mini_block(
     }
 
     // Only try Delta+RLE for suitable data
-    if should_use_delta_rle(data).is_some() {
+    if should_use_delta_rle(data, data_type).is_some() {
         return Some(Box::new(DeltaRleEncoder::new()));
     }
 
@@ -274,6 +275,7 @@ fn try_delta_rle_for_block(
     data: &FixedWidthDataBlock,
     version: LanceFileVersion,
     params: &CompressionFieldParams,
+    data_type: &DataType,
 ) -> Option<(Box<dyn BlockCompressor>, CompressiveEncoding)> {
     if version < LanceFileVersion::V2_2 {
         return None;
@@ -287,7 +289,7 @@ fn try_delta_rle_for_block(
         return None;
     }
 
-    if should_use_delta_rle(data).is_some() {
+    if should_use_delta_rle(data, data_type).is_some() {
         let bytes_per_value = (bits / 8) as usize;
         let mut bytes = [0u8; 8];
         bytes[..bytes_per_value].copy_from_slice(&data.data.as_ref()[..bytes_per_value]);
@@ -519,6 +521,7 @@ impl DefaultCompressionStrategy {
 
     fn build_fixed_width_compressor(
         &self,
+        field: &Field,
         params: &CompressionFieldParams,
         data: &FixedWidthDataBlock,
     ) -> Result<Box<dyn MiniBlockCompressor>> {
@@ -527,7 +530,7 @@ impl DefaultCompressionStrategy {
         }
 
         let base = try_bss_for_mini_block(data, params)
-            .or_else(|| try_delta_rle_for_mini_block(data, self.version, params))
+            .or_else(|| try_delta_rle_for_mini_block(data, self.version, params, &field.data_type()))
             .or_else(|| try_rle_for_mini_block(data, params))
             .or_else(|| try_bitpack_for_mini_block(data))
             .unwrap_or_else(|| Box::new(ValueEncoder::default()));
@@ -606,7 +609,7 @@ impl CompressionStrategy for DefaultCompressionStrategy {
         match data {
             DataBlock::FixedWidth(fixed_width_data) => {
                 let field_params = self.get_merged_field_params(field);
-                self.build_fixed_width_compressor(&field_params, fixed_width_data)
+                self.build_fixed_width_compressor(field, &field_params, fixed_width_data)
             }
             DataBlock::VariableWidth(variable_width_data) => {
                 self.build_variable_width_compressor(field, variable_width_data)
@@ -736,7 +739,7 @@ impl CompressionStrategy for DefaultCompressionStrategy {
         match data {
             DataBlock::FixedWidth(fixed_width) => {
                 if let Some((compressor, encoding)) =
-                    try_delta_rle_for_block(fixed_width, self.version, &field_params)
+                    try_delta_rle_for_block(fixed_width, self.version, &field_params, &field.data_type())
                 {
                     return Ok((compressor, encoding));
                 }

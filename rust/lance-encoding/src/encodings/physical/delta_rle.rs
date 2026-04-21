@@ -39,6 +39,7 @@
 use std::io::Write;
 
 use arrow_buffer::ArrowNativeType;
+use arrow_schema::DataType;
 use bytemuck::Pod;
 use log::trace;
 
@@ -484,13 +485,19 @@ impl BlockDecompressor for DeltaRleDecompressor {
 /// Check if data is suitable for Delta+RLE encoding
 ///
 /// Returns Some(estimated_ratio) if suitable, None otherwise
-pub fn should_use_delta_rle(data: &FixedWidthDataBlock) -> Option<f64> {
+pub fn should_use_delta_rle(data: &FixedWidthDataBlock, data_type: &DataType) -> Option<f64> {
     if data.num_values < MIN_VALUES_FOR_DELTA_RLE {
         return None;
     }
 
     // Only support standard bit widths
     if !matches!(data.bits_per_value, 8 | 16 | 32 | 64) {
+        return None;
+    }
+
+    // Delta+RLE is designed for integer sequences (timestamps, IDs, counters).
+    // Floating point data rarely has meaningful monotonicity for delta encoding.
+    if matches!(data_type, DataType::Float32 | DataType::Float64) {
         return None;
     }
 
@@ -534,7 +541,7 @@ fn compute_monotonicity(data: &FixedWidthDataBlock) -> f64 {
 
 fn compute_monotonicity_typed<T>(data: &FixedWidthDataBlock) -> f64
 where
-    T: ArrowNativeType + Pod + Copy,
+    T: ArrowNativeType + Pod + Copy + PartialOrd,
 {
     let typed_data = data.data.borrow_to_typed_slice::<T>();
     let slice = typed_data.as_ref();
@@ -547,12 +554,12 @@ where
     let mut decreasing = 0usize;
 
     for i in 1..slice.len() {
-        let prev_i64 = value_to_i64(slice[i - 1]);
-        let curr_i64 = value_to_i64(slice[i]);
+        let prev = &slice[i - 1];
+        let curr = &slice[i];
 
-        if curr_i64 > prev_i64 {
+        if curr > prev {
             increasing += 1;
-        } else if curr_i64 < prev_i64 {
+        } else if curr < prev {
             decreasing += 1;
         }
         // Equal values don't count toward either
@@ -562,14 +569,6 @@ where
     let monotonic_count = increasing.max(decreasing);
 
     monotonic_count as f64 / total as f64
-}
-
-/// Convert any ArrowNativeType to i64
-#[inline]
-fn value_to_i64<T: ArrowNativeType>(value: T) -> i64 {
-    // Use as_usize() for unsigned types, which may truncate for u64 values > i64::MAX
-    // but this is acceptable for monotonicity detection
-    value.as_usize() as i64
 }
 
 /// Estimate the compression ratio for Delta+RLE
@@ -656,16 +655,27 @@ mod tests {
     fn test_should_use_delta_rle() {
         // Monotonic data with enough values
         let data = create_data_block(&(0..100u64).collect::<Vec<_>>());
-        assert!(should_use_delta_rle(&data).is_some());
+        assert!(should_use_delta_rle(&data, &DataType::UInt64).is_some());
 
         // Too few values
         let data = create_data_block(&[1u64, 2, 3]);
-        assert!(should_use_delta_rle(&data).is_none());
+        assert!(should_use_delta_rle(&data, &DataType::UInt64).is_none());
 
         // Not monotonic (oscillating pattern)
         let oscillating: Vec<u64> = (0..100).map(|i| if i % 2 == 0 { i + 2 } else { i }).collect();
         let data = create_data_block(&oscillating);
-        assert!(should_use_delta_rle(&data).is_none());
+        assert!(should_use_delta_rle(&data, &DataType::UInt64).is_none());
+
+        // Floating point data should be skipped
+        let float_data: Vec<f64> = (0..100).map(|i| i as f64).collect();
+        let bytes = bytemuck::cast_slice(&float_data);
+        let block = FixedWidthDataBlock {
+            data: LanceBuffer::from(bytes.to_vec()),
+            bits_per_value: 64,
+            num_values: float_data.len() as u64,
+            block_info: BlockInfo::default(),
+        };
+        assert!(should_use_delta_rle(&block, &DataType::Float64).is_none());
     }
 
     fn create_data_block(values: &[u64]) -> FixedWidthDataBlock {
