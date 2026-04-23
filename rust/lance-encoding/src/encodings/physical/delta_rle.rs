@@ -49,8 +49,8 @@ use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
     MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor,
 };
-use crate::format::pb21::CompressiveEncoding;
 use crate::format::ProtobufUtils21;
+use crate::format::pb21::CompressiveEncoding;
 // Statistics support can be added later if needed
 // use crate::statistics::{GetStat, Stat};
 
@@ -210,8 +210,7 @@ impl MiniBlockCompressor for DeltaRleEncoder {
 
                 trace!(
                     "DeltaRleEncoder compressing {} values with {} bits per value",
-                    num_values,
-                    bits_per_value
+                    num_values, bits_per_value
                 );
 
                 let (buffers, chunks, first_value) = match bits_per_value {
@@ -223,7 +222,7 @@ impl MiniBlockCompressor for DeltaRleEncoder {
                         return Err(Error::invalid_input(format!(
                             "DeltaRleEncoder only supports 8, 16, 32, or 64 bit values, got {}",
                             bits_per_value
-                        )))
+                        )));
                     }
                 };
 
@@ -247,8 +246,7 @@ impl MiniBlockCompressor for DeltaRleEncoder {
 
                 trace!(
                     "DeltaRleEncoder compressed {} values, first_value={}",
-                    num_values,
-                    first_value
+                    num_values, first_value
                 );
 
                 Ok((compressed, encoding))
@@ -278,7 +276,7 @@ impl BlockCompressor for DeltaRleEncoder {
                         return Err(Error::invalid_input(format!(
                             "DeltaRleEncoder only supports 8, 16, 32, or 64 bit values, got {}",
                             bits_per_value
-                        )))
+                        )));
                     }
                 };
 
@@ -324,51 +322,6 @@ impl DeltaRleDecompressor {
         }
     }
 
-    /// Decode RLE data to get deltas
-    fn rle_decode_deltas(values_buf: &[u8], lengths_buf: &[u8]) -> Vec<i64> {
-        let mut deltas = Vec::new();
-
-        let num_runs = values_buf.len() / 8;
-        for (i, &length) in lengths_buf.iter().enumerate().take(num_runs) {
-            let value_offset = i * 8;
-            let value = i64::from_le_bytes([
-                values_buf[value_offset],
-                values_buf[value_offset + 1],
-                values_buf[value_offset + 2],
-                values_buf[value_offset + 3],
-                values_buf[value_offset + 4],
-                values_buf[value_offset + 5],
-                values_buf[value_offset + 6],
-                values_buf[value_offset + 7],
-            ]);
-
-            deltas.extend(std::iter::repeat_n(value, length as usize));
-        }
-
-        deltas
-    }
-
-    /// Reconstruct original data from deltas
-    fn reconstruct_from_deltas<T>(first_value: i64, deltas: &[i64], num_values: u64) -> Vec<T>
-    where
-        T: ArrowNativeType,
-    {
-        let mut result = Vec::with_capacity(num_values as usize);
-        let mut current = first_value;
-
-        for (i, &delta) in deltas.iter().enumerate() {
-            if i == 0 {
-                // First value is stored directly
-                current = delta;
-            } else {
-                current += delta;
-            }
-            result.push(T::from_usize(current as usize).expect("value fits in target type"));
-        }
-
-        result
-    }
-
     /// Decode data for a specific type
     fn decode_data<T>(&self, buffers: &[LanceBuffer], num_values: u64) -> Result<LanceBuffer>
     where
@@ -390,29 +343,140 @@ impl DeltaRleDecompressor {
 
         let values_buf = buffers[0].as_ref();
         let lengths_buf = buffers[1].as_ref();
-
-        // RLE decode to get deltas
-        let deltas = Self::rle_decode_deltas(values_buf, lengths_buf);
-
-        if deltas.len() < num_values as usize {
+        let num_runs = values_buf.len() / 8;
+        if num_runs != lengths_buf.len() {
             return Err(Error::invalid_input_source(
                 format!(
-                    "DeltaRleDecompressor expected {} values but got {}",
-                    num_values,
-                    deltas.len()
+                    "DeltaRleDecompressor expected {} run lengths but got {}",
+                    num_runs,
+                    lengths_buf.len()
                 )
                 .into(),
             ));
         }
 
-        // Reconstruct original data
-        let reconstructed = Self::reconstruct_from_deltas::<T>(
-            self.first_value,
-            &deltas[..num_values as usize],
-            num_values,
-        );
+        let mut reconstructed = Vec::<T>::with_capacity(num_values as usize);
+        let mut current = self.first_value;
+        let mut is_first_delta = true;
+
+        for (delta_bytes, &run_length) in values_buf.chunks_exact(8).zip(lengths_buf.iter()) {
+            let delta = i64::from_le_bytes(delta_bytes.try_into().unwrap());
+            for _ in 0..run_length {
+                if reconstructed.len() == num_values as usize {
+                    break;
+                }
+                if is_first_delta {
+                    current = delta;
+                    is_first_delta = false;
+                } else {
+                    current += delta;
+                }
+                reconstructed
+                    .push(T::from_usize(current as usize).expect("value fits in target type"));
+            }
+            if reconstructed.len() == num_values as usize {
+                break;
+            }
+        }
+
+        if reconstructed.len() != num_values as usize {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "DeltaRleDecompressor expected {} values but got {}",
+                    num_values,
+                    reconstructed.len()
+                )
+                .into(),
+            ));
+        }
 
         Ok(LanceBuffer::reinterpret_vec(reconstructed))
+    }
+
+    fn decode_data_into<T>(
+        &self,
+        buffers: &[LanceBuffer],
+        num_values: u64,
+        destination: &mut [T],
+    ) -> Result<()>
+    where
+        T: ArrowNativeType + Pod,
+    {
+        if destination.len() != num_values as usize {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "DeltaRleDecompressor expected destination len {} but got {}",
+                    num_values,
+                    destination.len()
+                )
+                .into(),
+            ));
+        }
+
+        if num_values == 0 {
+            return Ok(());
+        }
+
+        if buffers.len() != 2 {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "DeltaRleDecompressor expects exactly 2 buffers, got {}",
+                    buffers.len()
+                )
+                .into(),
+            ));
+        }
+
+        let values_buf = buffers[0].as_ref();
+        let lengths_buf = buffers[1].as_ref();
+        let num_runs = values_buf.len() / 8;
+        if num_runs != lengths_buf.len() {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "DeltaRleDecompressor expected {} run lengths but got {}",
+                    num_runs,
+                    lengths_buf.len()
+                )
+                .into(),
+            ));
+        }
+
+        let mut current = self.first_value;
+        let mut is_first_delta = true;
+        let mut index = 0usize;
+
+        for (delta_bytes, &run_length) in values_buf.chunks_exact(8).zip(lengths_buf.iter()) {
+            let delta = i64::from_le_bytes(delta_bytes.try_into().unwrap());
+            for _ in 0..run_length {
+                if index == destination.len() {
+                    break;
+                }
+                if is_first_delta {
+                    current = delta;
+                    is_first_delta = false;
+                } else {
+                    current += delta;
+                }
+                destination[index] =
+                    T::from_usize(current as usize).expect("value fits in target type");
+                index += 1;
+            }
+            if index == destination.len() {
+                break;
+            }
+        }
+
+        if index != destination.len() {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "DeltaRleDecompressor expected {} values but got {}",
+                    num_values, index
+                )
+                .into(),
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -427,7 +491,7 @@ impl MiniBlockDecompressor for DeltaRleDecompressor {
                 return Err(Error::invalid_input(format!(
                     "DeltaRleDecompressor only supports 8, 16, 32, or 64 bit values, got {}",
                     self.bits_per_value
-                )))
+                )));
             }
         };
 
@@ -437,6 +501,62 @@ impl MiniBlockDecompressor for DeltaRleDecompressor {
             num_values,
             block_info: BlockInfo::default(),
         }))
+    }
+
+    fn fixed_width_output_bits_per_value(&self) -> Option<u64> {
+        Some(self.bits_per_value)
+    }
+
+    fn decompress_into_u8(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        destination: &mut [u8],
+    ) -> Result<bool> {
+        if self.bits_per_value != 8 {
+            return Ok(false);
+        }
+        self.decode_data_into::<u8>(data, num_values, destination)?;
+        Ok(true)
+    }
+
+    fn decompress_into_u16(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        destination: &mut [u16],
+    ) -> Result<bool> {
+        if self.bits_per_value != 16 {
+            return Ok(false);
+        }
+        self.decode_data_into::<u16>(data, num_values, destination)?;
+        Ok(true)
+    }
+
+    fn decompress_into_u32(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        destination: &mut [u32],
+    ) -> Result<bool> {
+        if self.bits_per_value != 32 {
+            return Ok(false);
+        }
+        self.decode_data_into::<u32>(data, num_values, destination)?;
+        Ok(true)
+    }
+
+    fn decompress_into_u64(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        destination: &mut [u64],
+    ) -> Result<bool> {
+        if self.bits_per_value != 64 {
+            return Ok(false);
+        }
+        self.decode_data_into::<u64>(data, num_values, destination)?;
+        Ok(true)
     }
 }
 
@@ -452,13 +572,25 @@ impl BlockDecompressor for DeltaRleDecompressor {
 
         // Parse headers
         let first_value = i64::from_le_bytes([
-            data_slice[0], data_slice[1], data_slice[2], data_slice[3],
-            data_slice[4], data_slice[5], data_slice[6], data_slice[7],
+            data_slice[0],
+            data_slice[1],
+            data_slice[2],
+            data_slice[3],
+            data_slice[4],
+            data_slice[5],
+            data_slice[6],
+            data_slice[7],
         ]);
 
         let values_size = u64::from_le_bytes([
-            data_slice[8], data_slice[9], data_slice[10], data_slice[11],
-            data_slice[12], data_slice[13], data_slice[14], data_slice[15],
+            data_slice[8],
+            data_slice[9],
+            data_slice[10],
+            data_slice[11],
+            data_slice[12],
+            data_slice[13],
+            data_slice[14],
+            data_slice[15],
         ]) as usize;
 
         if data_slice.len() < 16 + values_size {
@@ -506,8 +638,7 @@ pub fn should_use_delta_rle(data: &FixedWidthDataBlock, data_type: &DataType) ->
     if monotonicity < MIN_MONOTONICITY_RATIO {
         trace!(
             "Data not monotonic enough for Delta+RLE: {} < {}",
-            monotonicity,
-            MIN_MONOTONICITY_RATIO
+            monotonicity, MIN_MONOTONICITY_RATIO
         );
         return None;
     }
@@ -517,8 +648,7 @@ pub fn should_use_delta_rle(data: &FixedWidthDataBlock, data_type: &DataType) ->
     if estimated_ratio < MIN_COMPRESSION_RATIO {
         trace!(
             "Estimated compression ratio too low for Delta+RLE: {} < {}",
-            estimated_ratio,
-            MIN_COMPRESSION_RATIO
+            estimated_ratio, MIN_COMPRESSION_RATIO
         );
         return None;
     }
@@ -613,27 +743,26 @@ mod tests {
     }
 
     #[test]
-    fn test_rle_decode_deltas() {
-        // Create encoded data for [1000, 1, 1, 1, 1]
+    fn test_decode_data_streams_runs_directly() {
+        // Create encoded delta data for [1000, 1001, 1002, 1003, 1004]
         let values_buf = vec![
             0xE8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 1000 in little-endian
             0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 1 in little-endian
         ];
         let lengths_buf = vec![1, 4];
+        let decompressor = DeltaRleDecompressor::new(64, 1000);
+        let decoded = decompressor
+            .decode_data::<u64>(
+                &[
+                    LanceBuffer::from(values_buf),
+                    LanceBuffer::from(lengths_buf),
+                ],
+                5,
+            )
+            .unwrap();
+        let decoded = decoded.borrow_to_typed_slice::<u64>();
 
-        let deltas = DeltaRleDecompressor::rle_decode_deltas(&values_buf, &lengths_buf);
-        assert_eq!(deltas, vec![1000, 1, 1, 1, 1]);
-    }
-
-    #[test]
-    fn test_reconstruct_from_deltas() {
-        let deltas = vec![1000i64, 1, 1, 1, 1];
-        let first_value = 1000;
-
-        let reconstructed: Vec<i64> =
-            DeltaRleDecompressor::reconstruct_from_deltas(first_value, &deltas, 5);
-
-        assert_eq!(reconstructed, vec![1000, 1001, 1002, 1003, 1004]);
+        assert_eq!(decoded.as_ref(), &[1000, 1001, 1002, 1003, 1004]);
     }
 
     #[test]
@@ -662,7 +791,9 @@ mod tests {
         assert!(should_use_delta_rle(&data, &DataType::UInt64).is_none());
 
         // Not monotonic (oscillating pattern)
-        let oscillating: Vec<u64> = (0..100).map(|i| if i % 2 == 0 { i + 2 } else { i }).collect();
+        let oscillating: Vec<u64> = (0..100)
+            .map(|i| if i % 2 == 0 { i + 2 } else { i })
+            .collect();
         let data = create_data_block(&oscillating);
         assert!(should_use_delta_rle(&data, &DataType::UInt64).is_none());
 
@@ -912,7 +1043,8 @@ mod tests {
                 num_values: count as u64,
                 block_info: BlockInfo::default(),
             });
-            let (rle_compressed, _) = MiniBlockCompressor::compress(&rle_encoder, rle_block).unwrap();
+            let (rle_compressed, _) =
+                MiniBlockCompressor::compress(&rle_encoder, rle_block).unwrap();
             let rle_size = rle_compressed
                 .data
                 .iter()
@@ -929,7 +1061,10 @@ mod tests {
             assert!(
                 ratio < 0.5,
                 "{}: Delta+RLE ({}) should be at least 2x better than RLE ({}), got ratio {:.2}",
-                name, delta_rle_size, rle_size, ratio
+                name,
+                delta_rle_size,
+                rle_size,
+                ratio
             );
         }
 
@@ -963,7 +1098,8 @@ mod tests {
                 num_values: count as u64,
                 block_info: BlockInfo::default(),
             });
-            let (rle_compressed, _) = MiniBlockCompressor::compress(&rle_encoder, rle_block).unwrap();
+            let (rle_compressed, _) =
+                MiniBlockCompressor::compress(&rle_encoder, rle_block).unwrap();
             let rle_size = rle_compressed
                 .data
                 .iter()
@@ -980,7 +1116,10 @@ mod tests {
             assert!(
                 ratio < 0.5,
                 "{}: Delta+RLE ({}) should be at least 2x better than RLE ({}), got ratio {:.2}",
-                name, delta_rle_size, rle_size, ratio
+                name,
+                delta_rle_size,
+                rle_size,
+                ratio
             );
         }
     }
@@ -1005,11 +1144,7 @@ mod tests {
         let original_size = bytes.len() as f64;
 
         let (compressed, _) = MiniBlockCompressor::compress(&encoder, block).unwrap();
-        let compressed_size = compressed
-            .data
-            .iter()
-            .map(|b| b.len() as f64)
-            .sum::<f64>();
+        let compressed_size = compressed.data.iter().map(|b| b.len() as f64).sum::<f64>();
 
         let compression_ratio = original_size / compressed_size;
         println!(
@@ -1048,7 +1183,8 @@ mod tests {
 
         // Decompress
         let decompressor = DeltaRleDecompressor::new(64, data[0] as i64);
-        let decompressed = BlockDecompressor::decompress(&decompressor, compressed, data.len() as u64).unwrap();
+        let decompressed =
+            BlockDecompressor::decompress(&decompressor, compressed, data.len() as u64).unwrap();
 
         // Verify round-trip correctness
         match decompressed {

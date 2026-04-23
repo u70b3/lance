@@ -53,10 +53,10 @@ use crate::{
 /// Pages larger than this will be split into multiple chunks during read
 pub const DEFAULT_READ_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
 
-// For now, we don't use global buffers for anything other than schema.  If we
-// use these later we should make them lazily loaded and then cached once loaded.
-//
-// We store their position / length for debugging purposes
+// Global buffers are used for file-level metadata such as the schema (buffer 0)
+// and arbitrary user-provided data (e.g. IVF index metadata, PQ codebooks,
+// bitmap index data).  They are written after all data pages and before column
+// metadata.  We store their position / length for debugging purposes.
 #[derive(Debug, DeepSizeOf)]
 pub struct BufferDescriptor {
     pub position: u64,

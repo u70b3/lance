@@ -1057,8 +1057,11 @@ async fn open_writer_with_options(
         let enable_blob_v2 = storage_version >= LanceFileVersion::V2_2;
         let encoding_strategy = if let Some(params) = compression_params {
             Some(
-                lance_encoding::encoder::default_encoding_strategy_with_params(storage_version, params)
-                    .map(|s| Arc::from(s))?,
+                lance_encoding::encoder::default_encoding_strategy_with_params(
+                    storage_version,
+                    params,
+                )
+                .map(|s| Arc::from(s))?,
             )
         } else {
             None

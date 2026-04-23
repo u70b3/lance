@@ -8,12 +8,12 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 
 use lance_encoding::{
-    encoder::{default_encoding_strategy, encode_batch, EncodingOptions},
-    version::LanceFileVersion,
     compression::MiniBlockDecompressor,
+    encoder::{EncodingOptions, default_encoding_strategy, encode_batch},
+    version::LanceFileVersion,
 };
 
 /// Generate monotonic increasing i64 data (timestamps)
@@ -47,12 +47,14 @@ fn bench_delta_rle_compress(c: &mut Criterion) {
         // Timestamp data (i64)
         let data = generate_timestamp_data(size);
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let block = lance_encoding::data::DataBlock::FixedWidth(lance_encoding::data::FixedWidthDataBlock {
-            data: lance_encoding::buffer::LanceBuffer::from(bytes),
-            bits_per_value: 64,
-            num_values: size as u64,
-            block_info: lance_encoding::data::BlockInfo::default(),
-        });
+        let block = lance_encoding::data::DataBlock::FixedWidth(
+            lance_encoding::data::FixedWidthDataBlock {
+                data: lance_encoding::buffer::LanceBuffer::from(bytes),
+                bits_per_value: 64,
+                num_values: size as u64,
+                block_info: lance_encoding::data::BlockInfo::default(),
+            },
+        );
 
         let encoder = lance_encoding::encodings::physical::delta_rle::DeltaRleEncoder::new();
 
@@ -79,12 +81,14 @@ fn bench_delta_rle_decompress(c: &mut Criterion) {
         // Timestamp data (i64)
         let data = generate_timestamp_data(size);
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let block = lance_encoding::data::DataBlock::FixedWidth(lance_encoding::data::FixedWidthDataBlock {
-            data: lance_encoding::buffer::LanceBuffer::from(bytes),
-            bits_per_value: 64,
-            num_values: size as u64,
-            block_info: lance_encoding::data::BlockInfo::default(),
-        });
+        let block = lance_encoding::data::DataBlock::FixedWidth(
+            lance_encoding::data::FixedWidthDataBlock {
+                data: lance_encoding::buffer::LanceBuffer::from(bytes),
+                bits_per_value: 64,
+                num_values: size as u64,
+                block_info: lance_encoding::data::BlockInfo::default(),
+            },
+        );
 
         let encoder = lance_encoding::encodings::physical::delta_rle::DeltaRleEncoder::new();
         let (compressed, _) = lance_encoding::encodings::logical::primitive::miniblock::MiniBlockCompressor::compress(
@@ -93,7 +97,11 @@ fn bench_delta_rle_decompress(c: &mut Criterion) {
         )
         .unwrap();
 
-        let decompressor = lance_encoding::encodings::physical::delta_rle::DeltaRleDecompressor::new(64, data[0] as i64);
+        let decompressor =
+            lance_encoding::encodings::physical::delta_rle::DeltaRleDecompressor::new(
+                64,
+                data[0] as i64,
+            );
 
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, _| {
             b.iter(|| {
@@ -123,13 +131,16 @@ fn bench_delta_rle_vs_rle_compress(c: &mut Criterion) {
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
 
         // Delta+RLE
-        let delta_rle_encoder = lance_encoding::encodings::physical::delta_rle::DeltaRleEncoder::new();
-        let delta_rle_block = lance_encoding::data::DataBlock::FixedWidth(lance_encoding::data::FixedWidthDataBlock {
-            data: lance_encoding::buffer::LanceBuffer::from(bytes.clone()),
-            bits_per_value: 64,
-            num_values: size as u64,
-            block_info: lance_encoding::data::BlockInfo::default(),
-        });
+        let delta_rle_encoder =
+            lance_encoding::encodings::physical::delta_rle::DeltaRleEncoder::new();
+        let delta_rle_block = lance_encoding::data::DataBlock::FixedWidth(
+            lance_encoding::data::FixedWidthDataBlock {
+                data: lance_encoding::buffer::LanceBuffer::from(bytes.clone()),
+                bits_per_value: 64,
+                num_values: size as u64,
+                block_info: lance_encoding::data::BlockInfo::default(),
+            },
+        );
 
         group.bench_function(format!("delta_rle_{}", size), |b| {
             b.iter(|| {
@@ -143,12 +154,14 @@ fn bench_delta_rle_vs_rle_compress(c: &mut Criterion) {
 
         // RLE
         let rle_encoder = lance_encoding::encodings::physical::rle::RleEncoder::new();
-        let rle_block = lance_encoding::data::DataBlock::FixedWidth(lance_encoding::data::FixedWidthDataBlock {
-            data: lance_encoding::buffer::LanceBuffer::from(bytes),
-            bits_per_value: 64,
-            num_values: size as u64,
-            block_info: lance_encoding::data::BlockInfo::default(),
-        });
+        let rle_block = lance_encoding::data::DataBlock::FixedWidth(
+            lance_encoding::data::FixedWidthDataBlock {
+                data: lance_encoding::buffer::LanceBuffer::from(bytes),
+                bits_per_value: 64,
+                num_values: size as u64,
+                block_info: lance_encoding::data::BlockInfo::default(),
+            },
+        );
 
         group.bench_function(format!("rle_{}", size), |b| {
             b.iter(|| {
@@ -179,10 +192,7 @@ fn bench_delta_rle_end_to_end(c: &mut Criterion) {
 
     // Enable delta-rle encoding via metadata
     let mut metadata = HashMap::new();
-    metadata.insert(
-        "lance-encoding:delta-rle".to_string(),
-        "true".to_string(),
-    );
+    metadata.insert("lance-encoding:delta-rle".to_string(), "true".to_string());
     // Disable BSS to isolate delta-rle performance
     metadata.insert("lance-encoding:bss".to_string(), "off".to_string());
 

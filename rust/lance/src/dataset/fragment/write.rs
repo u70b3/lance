@@ -13,10 +13,10 @@ use lance_file::previous::writer::FileWriter as PreviousFileWriter;
 use lance_file::version::LanceFileVersion;
 use lance_file::writer::FileWriterOptions;
 use lance_io::object_store::ObjectStore;
-use std::sync::Arc;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::io::manifest::ManifestDescribing;
 use std::borrow::Cow;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::Result;

@@ -22,8 +22,8 @@ use crate::{
     buffer::LanceBuffer,
     compression_config::{BssMode, CompressionFieldParams, CompressionParams},
     constants::{
-        BSS_META_KEY, COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY,
-        DELTA_RLE_META_KEY, RLE_THRESHOLD_META_KEY,
+        BSS_META_KEY, COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, DELTA_RLE_META_KEY,
+        RLE_THRESHOLD_META_KEY,
     },
     data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock},
     encodings::{
@@ -530,7 +530,9 @@ impl DefaultCompressionStrategy {
         }
 
         let base = try_bss_for_mini_block(data, params)
-            .or_else(|| try_delta_rle_for_mini_block(data, self.version, params, &field.data_type()))
+            .or_else(|| {
+                try_delta_rle_for_mini_block(data, self.version, params, &field.data_type())
+            })
             .or_else(|| try_rle_for_mini_block(data, params))
             .or_else(|| try_bitpack_for_mini_block(data))
             .unwrap_or_else(|| Box::new(ValueEncoder::default()));
@@ -738,9 +740,12 @@ impl CompressionStrategy for DefaultCompressionStrategy {
 
         match data {
             DataBlock::FixedWidth(fixed_width) => {
-                if let Some((compressor, encoding)) =
-                    try_delta_rle_for_block(fixed_width, self.version, &field_params, &field.data_type())
-                {
+                if let Some((compressor, encoding)) = try_delta_rle_for_block(
+                    fixed_width,
+                    self.version,
+                    &field_params,
+                    &field.data_type(),
+                ) {
                     return Ok((compressor, encoding));
                 }
                 if let Some((compressor, encoding)) =
@@ -796,6 +801,48 @@ impl CompressionStrategy for DefaultCompressionStrategy {
 
 pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock>;
+
+    /// Returns the byte-aligned fixed-width of the decompressed output when this
+    /// miniblock decoder can materialize directly into a primitive destination.
+    fn fixed_width_output_bits_per_value(&self) -> Option<u64> {
+        None
+    }
+
+    fn decompress_into_u8(
+        &self,
+        _data: &[LanceBuffer],
+        _num_values: u64,
+        _destination: &mut [u8],
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn decompress_into_u16(
+        &self,
+        _data: &[LanceBuffer],
+        _num_values: u64,
+        _destination: &mut [u16],
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn decompress_into_u32(
+        &self,
+        _data: &[LanceBuffer],
+        _num_values: u64,
+        _destination: &mut [u32],
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn decompress_into_u64(
+        &self,
+        _data: &[LanceBuffer],
+        _num_values: u64,
+        _destination: &mut [u64],
+    ) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 pub trait FixedPerValueDecompressor: std::fmt::Debug + Send + Sync {
@@ -805,6 +852,44 @@ pub trait FixedPerValueDecompressor: std::fmt::Debug + Send + Sync {
     ///
     /// Currently (and probably long term) this must be a multiple of 8
     fn bits_per_value(&self) -> u64;
+
+    /// Returns the byte-aligned fixed-width of the decompressed output when this
+    /// per-value decoder can materialize directly into a primitive destination.
+    fn fixed_width_output_bits_per_value(&self) -> Option<u64> {
+        None
+    }
+
+    fn decompress_into_u8(
+        &self,
+        _data: FixedWidthDataBlock,
+        _destination: &mut [u8],
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn decompress_into_u16(
+        &self,
+        _data: FixedWidthDataBlock,
+        _destination: &mut [u16],
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn decompress_into_u32(
+        &self,
+        _data: FixedWidthDataBlock,
+        _destination: &mut [u32],
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn decompress_into_u64(
+        &self,
+        _data: FixedWidthDataBlock,
+        _destination: &mut [u64],
+    ) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 pub trait VariablePerValueDecompressor: std::fmt::Debug + Send + Sync {
@@ -898,12 +983,10 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 let bits_per_value = validate_rle_compression(rle)?;
                 Ok(Box::new(RleDecompressor::new(bits_per_value)))
             }
-            Compression::DeltaRle(delta_rle) => {
-                Ok(Box::new(DeltaRleDecompressor::new(
-                    delta_rle.uncompressed_bits_per_value,
-                    delta_rle.first_value,
-                )))
-            }
+            Compression::DeltaRle(delta_rle) => Ok(Box::new(DeltaRleDecompressor::new(
+                delta_rle.uncompressed_bits_per_value,
+                delta_rle.first_value,
+            ))),
             Compression::ByteStreamSplit(bss) => {
                 let Compression::Flat(values) =
                     bss.values.as_ref().unwrap().compression.as_ref().unwrap()
@@ -1094,12 +1177,10 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 let bits_per_value = validate_rle_compression(rle)?;
                 Ok(Box::new(RleDecompressor::new(bits_per_value)))
             }
-            Compression::DeltaRle(delta_rle) => {
-                Ok(Box::new(DeltaRleDecompressor::new(
-                    delta_rle.uncompressed_bits_per_value,
-                    delta_rle.first_value,
-                )))
-            }
+            Compression::DeltaRle(delta_rle) => Ok(Box::new(DeltaRleDecompressor::new(
+                delta_rle.uncompressed_bits_per_value,
+                delta_rle.first_value,
+            ))),
             _ => todo!(),
         }
     }

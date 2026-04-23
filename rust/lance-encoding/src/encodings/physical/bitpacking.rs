@@ -15,10 +15,11 @@
 //! The encoding is transparent because the output has a fixed width (just like the input) and
 //! we can easily jump to the correct value.
 
+use std::mem::MaybeUninit;
+
 use arrow_array::types::UInt64Type;
 use arrow_array::{Array, PrimitiveArray};
 use arrow_buffer::ArrowNativeType;
-use byteorder::{ByteOrder, LittleEndian};
 use lance_bitpacking::BitPacking;
 
 use lance_core::{Error, Result};
@@ -33,7 +34,7 @@ use crate::encodings::logical::primitive::miniblock::{
 use crate::format::pb21::CompressiveEncoding;
 use crate::format::{ProtobufUtils21, pb21};
 use crate::statistics::{GetStat, Stat};
-use bytemuck::{AnyBitPattern, cast_slice};
+use bytemuck::Pod;
 
 const LOG_ELEMS_PER_CHUNK: u8 = 10;
 const ELEMS_PER_CHUNK: u64 = 1 << LOG_ELEMS_PER_CHUNK;
@@ -181,7 +182,7 @@ impl InlineBitpacking {
         )
     }
 
-    fn unchunk<T: ArrowNativeType + BitPacking + AnyBitPattern>(
+    fn unchunk<T: ArrowNativeType + BitPacking + Pod>(
         data: LanceBuffer,
         num_values: u64,
     ) -> Result<DataBlock> {
@@ -189,28 +190,69 @@ impl InlineBitpacking {
         assert!(data.len() >= std::mem::size_of::<T>());
         assert!(num_values <= ELEMS_PER_CHUNK);
 
-        // This macro decompresses a chunk(1024 values) of bitpacked values.
         let uncompressed_bit_width = std::mem::size_of::<T>() * 8;
-        let mut decompressed = vec![T::from_usize(0).unwrap(); ELEMS_PER_CHUNK as usize];
-
-        // Copy for memory alignment
-        let chunk_in_u8: Vec<u8> = data.to_vec();
-        let bit_width_bytes = &chunk_in_u8[..std::mem::size_of::<T>()];
-        let bit_width_value = LittleEndian::read_uint(bit_width_bytes, std::mem::size_of::<T>());
-        let chunk = cast_slice(&chunk_in_u8[std::mem::size_of::<T>()..]);
+        let chunk_words = data.borrow_to_typed_view::<T>();
+        let chunk_words = chunk_words.as_ref();
+        let bit_width_value = chunk_words[0].as_usize();
+        let chunk = &chunk_words[1..];
         // The bit-packed chunk should have number of bytes (bit_width_value * ELEMS_PER_CHUNK / 8)
-        assert!(std::mem::size_of_val(chunk) == (bit_width_value * ELEMS_PER_CHUNK) as usize / 8);
+        assert!(std::mem::size_of_val(chunk) == bit_width_value * ELEMS_PER_CHUNK as usize / 8);
+
+        // Allocate the output once and let the unpacker fully initialize it in place.
+        let mut decompressed = Vec::<MaybeUninit<T>>::with_capacity(ELEMS_PER_CHUNK as usize);
         unsafe {
-            BitPacking::unchecked_unpack(bit_width_value as usize, chunk, &mut decompressed);
+            decompressed.set_len(ELEMS_PER_CHUNK as usize);
+            let out = std::slice::from_raw_parts_mut(
+                decompressed.as_mut_ptr() as *mut T,
+                ELEMS_PER_CHUNK as usize,
+            );
+            BitPacking::unchecked_unpack(bit_width_value, chunk, out);
+            let cap = decompressed.capacity();
+            let ptr = decompressed.as_mut_ptr() as *mut T;
+            std::mem::forget(decompressed);
+            let decompressed = Vec::from_raw_parts(ptr, num_values as usize, cap);
+            Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(decompressed),
+                bits_per_value: uncompressed_bit_width as u64,
+                num_values,
+                block_info: BlockInfo::new(),
+            }))
+        }
+    }
+
+    fn unchunk_into<T: ArrowNativeType + BitPacking + Pod>(
+        data: &LanceBuffer,
+        num_values: u64,
+        destination: &mut [T],
+    ) -> Result<()> {
+        assert_eq!(destination.len(), num_values as usize);
+        assert!(data.len() >= std::mem::size_of::<T>());
+        assert!(num_values <= ELEMS_PER_CHUNK);
+
+        let chunk_words = data.borrow_to_typed_view::<T>();
+        let chunk_words = chunk_words.as_ref();
+        let bit_width_value = chunk_words[0].as_usize();
+        let chunk = &chunk_words[1..];
+        assert!(std::mem::size_of_val(chunk) == bit_width_value * ELEMS_PER_CHUNK as usize / 8);
+
+        if num_values == ELEMS_PER_CHUNK {
+            unsafe {
+                BitPacking::unchecked_unpack(bit_width_value, chunk, destination);
+            }
+            return Ok(());
         }
 
-        decompressed.truncate(num_values as usize);
-        Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
-            data: LanceBuffer::reinterpret_vec(decompressed),
-            bits_per_value: uncompressed_bit_width as u64,
-            num_values,
-            block_info: BlockInfo::new(),
-        }))
+        let mut scratch = Vec::<MaybeUninit<T>>::with_capacity(ELEMS_PER_CHUNK as usize);
+        unsafe {
+            scratch.set_len(ELEMS_PER_CHUNK as usize);
+            let unpacked = std::slice::from_raw_parts_mut(
+                scratch.as_mut_ptr() as *mut T,
+                ELEMS_PER_CHUNK as usize,
+            );
+            BitPacking::unchecked_unpack(bit_width_value, chunk, unpacked);
+            destination.copy_from_slice(&unpacked[..num_values as usize]);
+        }
+        Ok(())
     }
 }
 
@@ -248,6 +290,62 @@ impl MiniBlockDecompressor for InlineBitpacking {
             64 => Self::unchunk::<u64>(data, num_values),
             _ => unimplemented!("Bitpacking word size must be 8, 16, 32, or 64"),
         }
+    }
+
+    fn fixed_width_output_bits_per_value(&self) -> Option<u64> {
+        Some(self.uncompressed_bit_width)
+    }
+
+    fn decompress_into_u8(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        destination: &mut [u8],
+    ) -> Result<bool> {
+        if self.uncompressed_bit_width != 8 || data.len() != 1 {
+            return Ok(false);
+        }
+        Self::unchunk_into::<u8>(&data[0], num_values, destination)?;
+        Ok(true)
+    }
+
+    fn decompress_into_u16(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        destination: &mut [u16],
+    ) -> Result<bool> {
+        if self.uncompressed_bit_width != 16 || data.len() != 1 {
+            return Ok(false);
+        }
+        Self::unchunk_into::<u16>(&data[0], num_values, destination)?;
+        Ok(true)
+    }
+
+    fn decompress_into_u32(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        destination: &mut [u32],
+    ) -> Result<bool> {
+        if self.uncompressed_bit_width != 32 || data.len() != 1 {
+            return Ok(false);
+        }
+        Self::unchunk_into::<u32>(&data[0], num_values, destination)?;
+        Ok(true)
+    }
+
+    fn decompress_into_u64(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        destination: &mut [u64],
+    ) -> Result<bool> {
+        if self.uncompressed_bit_width != 64 || data.len() != 1 {
+            return Ok(false);
+        }
+        Self::unchunk_into::<u64>(&data[0], num_values, destination)?;
+        Ok(true)
     }
 }
 

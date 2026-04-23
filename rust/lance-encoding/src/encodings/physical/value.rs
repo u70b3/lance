@@ -562,6 +562,13 @@ impl ValueDecompressor {
             block_info: BlockInfo::new(),
         })
     }
+
+    fn can_direct_copy(&self, bits_per_value: u64) -> bool {
+        self.layers.is_empty()
+            && self.items_per_value == 1
+            && self.bits_per_item == bits_per_value
+            && self.bits_per_value == bits_per_value
+    }
 }
 
 impl BlockDecompressor for ValueDecompressor {
@@ -599,6 +606,76 @@ impl MiniBlockDecompressor for ValueDecompressor {
 
         assert_eq!(lists.num_values(), num_values);
         Ok(lists)
+    }
+
+    fn fixed_width_output_bits_per_value(&self) -> Option<u64> {
+        if self.can_direct_copy(8)
+            || self.can_direct_copy(16)
+            || self.can_direct_copy(32)
+            || self.can_direct_copy(64)
+        {
+            Some(self.bits_per_item)
+        } else {
+            None
+        }
+    }
+
+    fn decompress_into_u8(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        destination: &mut [u8],
+    ) -> Result<bool> {
+        if !self.can_direct_copy(8) || data.len() != 1 || destination.len() != num_values as usize {
+            return Ok(false);
+        }
+        destination.copy_from_slice(data[0].as_ref());
+        Ok(true)
+    }
+
+    fn decompress_into_u16(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        destination: &mut [u16],
+    ) -> Result<bool> {
+        if !self.can_direct_copy(16) || data.len() != 1 || destination.len() != num_values as usize
+        {
+            return Ok(false);
+        }
+        let source = data[0].borrow_to_typed_slice::<u16>();
+        destination.copy_from_slice(source.as_ref());
+        Ok(true)
+    }
+
+    fn decompress_into_u32(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        destination: &mut [u32],
+    ) -> Result<bool> {
+        if !self.can_direct_copy(32) || data.len() != 1 || destination.len() != num_values as usize
+        {
+            return Ok(false);
+        }
+        let source = data[0].borrow_to_typed_slice::<u32>();
+        destination.copy_from_slice(source.as_ref());
+        Ok(true)
+    }
+
+    fn decompress_into_u64(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        destination: &mut [u64],
+    ) -> Result<bool> {
+        if !self.can_direct_copy(64) || data.len() != 1 || destination.len() != num_values as usize
+        {
+            return Ok(false);
+        }
+        let source = data[0].borrow_to_typed_slice::<u64>();
+        destination.copy_from_slice(source.as_ref());
+        Ok(true)
     }
 }
 
@@ -727,6 +804,69 @@ impl FixedPerValueDecompressor for ValueDecompressor {
 
     fn bits_per_value(&self) -> u64 {
         self.bits_per_value
+    }
+
+    fn fixed_width_output_bits_per_value(&self) -> Option<u64> {
+        if self.can_direct_copy(8)
+            || self.can_direct_copy(16)
+            || self.can_direct_copy(32)
+            || self.can_direct_copy(64)
+        {
+            Some(self.bits_per_value)
+        } else {
+            None
+        }
+    }
+
+    fn decompress_into_u8(
+        &self,
+        data: FixedWidthDataBlock,
+        destination: &mut [u8],
+    ) -> Result<bool> {
+        if !self.can_direct_copy(8) || destination.len() != data.num_values as usize {
+            return Ok(false);
+        }
+        destination.copy_from_slice(data.data.as_ref());
+        Ok(true)
+    }
+
+    fn decompress_into_u16(
+        &self,
+        data: FixedWidthDataBlock,
+        destination: &mut [u16],
+    ) -> Result<bool> {
+        if !self.can_direct_copy(16) || destination.len() != data.num_values as usize {
+            return Ok(false);
+        }
+        let source = data.data.borrow_to_typed_slice::<u16>();
+        destination.copy_from_slice(source.as_ref());
+        Ok(true)
+    }
+
+    fn decompress_into_u32(
+        &self,
+        data: FixedWidthDataBlock,
+        destination: &mut [u32],
+    ) -> Result<bool> {
+        if !self.can_direct_copy(32) || destination.len() != data.num_values as usize {
+            return Ok(false);
+        }
+        let source = data.data.borrow_to_typed_slice::<u32>();
+        destination.copy_from_slice(source.as_ref());
+        Ok(true)
+    }
+
+    fn decompress_into_u64(
+        &self,
+        data: FixedWidthDataBlock,
+        destination: &mut [u64],
+    ) -> Result<bool> {
+        if !self.can_direct_copy(64) || destination.len() != data.num_values as usize {
+            return Ok(false);
+        }
+        let source = data.data.borrow_to_typed_slice::<u64>();
+        destination.copy_from_slice(source.as_ref());
+        Ok(true)
     }
 }
 

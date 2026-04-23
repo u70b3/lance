@@ -146,6 +146,194 @@ struct DecodedMiniBlockChunk {
     values: DataBlock,
 }
 
+#[derive(Debug)]
+struct ParsedMiniBlockChunk {
+    num_levels: u16,
+    rep: Option<LanceBuffer>,
+    def: Option<LanceBuffer>,
+    values: Vec<LanceBuffer>,
+}
+
+#[derive(Debug)]
+enum DirectFixedWidthDecodeBuffer {
+    U8(Vec<u8>),
+    U16(Vec<u16>),
+    U32(Vec<u32>),
+    U64(Vec<u64>),
+}
+
+impl DirectFixedWidthDecodeBuffer {
+    fn with_capacity(bits_per_value: u64, num_values: usize) -> Result<Self> {
+        match bits_per_value {
+            8 => Ok(Self::U8(vec![0; num_values])),
+            16 => Ok(Self::U16(vec![0; num_values])),
+            32 => Ok(Self::U32(vec![0; num_values])),
+            64 => Ok(Self::U64(vec![0; num_values])),
+            _ => Err(Error::internal(format!(
+                "Direct fixed-width decode only supports 8/16/32/64-bit outputs, got {bits_per_value}"
+            ))),
+        }
+    }
+
+    fn try_decode_full_chunk(
+        &mut self,
+        decompressor: &dyn MiniBlockDecompressor,
+        buffers: &[LanceBuffer],
+        num_values: u64,
+        output_offset: usize,
+    ) -> Result<bool> {
+        match self {
+            Self::U8(values) => decompressor.decompress_into_u8(
+                buffers,
+                num_values,
+                &mut values[output_offset..output_offset + num_values as usize],
+            ),
+            Self::U16(values) => decompressor.decompress_into_u16(
+                buffers,
+                num_values,
+                &mut values[output_offset..output_offset + num_values as usize],
+            ),
+            Self::U32(values) => decompressor.decompress_into_u32(
+                buffers,
+                num_values,
+                &mut values[output_offset..output_offset + num_values as usize],
+            ),
+            Self::U64(values) => decompressor.decompress_into_u64(
+                buffers,
+                num_values,
+                &mut values[output_offset..output_offset + num_values as usize],
+            ),
+        }
+    }
+
+    fn try_decode_full_zip_buffer(
+        &mut self,
+        decompressor: &dyn FixedPerValueDecompressor,
+        data: FixedWidthDataBlock,
+        output_offset: usize,
+    ) -> Result<bool> {
+        let num_values = data.num_values as usize;
+        match self {
+            Self::U8(values) => decompressor
+                .decompress_into_u8(data, &mut values[output_offset..output_offset + num_values]),
+            Self::U16(values) => decompressor
+                .decompress_into_u16(data, &mut values[output_offset..output_offset + num_values]),
+            Self::U32(values) => decompressor
+                .decompress_into_u32(data, &mut values[output_offset..output_offset + num_values]),
+            Self::U64(values) => decompressor
+                .decompress_into_u64(data, &mut values[output_offset..output_offset + num_values]),
+        }
+    }
+
+    fn append_selection(
+        &mut self,
+        values: DataBlock,
+        selection: Range<u64>,
+        output_offset: usize,
+    ) -> Result<()> {
+        let fixed = match values {
+            DataBlock::FixedWidth(fixed) => fixed,
+            other => {
+                return Err(Error::internal(format!(
+                    "Expected fixed-width DataBlock in direct fixed-width fast path, got {}",
+                    other.name()
+                )));
+            }
+        };
+        let selection_len = (selection.end - selection.start) as usize;
+        match self {
+            Self::U8(output) => {
+                if fixed.bits_per_value != 8 {
+                    return Err(Error::internal(format!(
+                        "Expected 8-bit DataBlock in direct fixed-width fast path, got {}",
+                        fixed.bits_per_value
+                    )));
+                }
+                output[output_offset..output_offset + selection_len]
+                    .copy_from_slice(&fixed.data[selection.start as usize..selection.end as usize]);
+            }
+            Self::U16(output) => {
+                if fixed.bits_per_value != 16 {
+                    return Err(Error::internal(format!(
+                        "Expected 16-bit DataBlock in direct fixed-width fast path, got {}",
+                        fixed.bits_per_value
+                    )));
+                }
+                let source = fixed.data.borrow_to_typed_slice::<u16>();
+                output[output_offset..output_offset + selection_len].copy_from_slice(
+                    &source.as_ref()[selection.start as usize..selection.end as usize],
+                );
+            }
+            Self::U32(output) => {
+                if fixed.bits_per_value != 32 {
+                    return Err(Error::internal(format!(
+                        "Expected 32-bit DataBlock in direct fixed-width fast path, got {}",
+                        fixed.bits_per_value
+                    )));
+                }
+                let source = fixed.data.borrow_to_typed_slice::<u32>();
+                output[output_offset..output_offset + selection_len].copy_from_slice(
+                    &source.as_ref()[selection.start as usize..selection.end as usize],
+                );
+            }
+            Self::U64(output) => {
+                if fixed.bits_per_value != 64 {
+                    return Err(Error::internal(format!(
+                        "Expected 64-bit DataBlock in direct fixed-width fast path, got {}",
+                        fixed.bits_per_value
+                    )));
+                }
+                let source = fixed.data.borrow_to_typed_slice::<u64>();
+                output[output_offset..output_offset + selection_len].copy_from_slice(
+                    &source.as_ref()[selection.start as usize..selection.end as usize],
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn into_data_block(self) -> DataBlock {
+        match self {
+            Self::U8(values) => {
+                let num_values = values.len() as u64;
+                DataBlock::FixedWidth(FixedWidthDataBlock {
+                    data: LanceBuffer::reinterpret_vec(values),
+                    bits_per_value: 8,
+                    num_values,
+                    block_info: BlockInfo::new(),
+                })
+            }
+            Self::U16(values) => {
+                let num_values = values.len() as u64;
+                DataBlock::FixedWidth(FixedWidthDataBlock {
+                    data: LanceBuffer::reinterpret_vec(values),
+                    bits_per_value: 16,
+                    num_values,
+                    block_info: BlockInfo::new(),
+                })
+            }
+            Self::U32(values) => {
+                let num_values = values.len() as u64;
+                DataBlock::FixedWidth(FixedWidthDataBlock {
+                    data: LanceBuffer::reinterpret_vec(values),
+                    bits_per_value: 32,
+                    num_values,
+                    block_info: BlockInfo::new(),
+                })
+            }
+            Self::U64(values) => {
+                let num_values = values.len() as u64;
+                DataBlock::FixedWidth(FixedWidthDataBlock {
+                    data: LanceBuffer::reinterpret_vec(values),
+                    bits_per_value: 64,
+                    num_values,
+                    block_info: BlockInfo::new(),
+                })
+            }
+        }
+    }
+}
+
 /// A task to decode a one or more mini-blocks of data into an output batch
 ///
 /// Note: Two batches might share the same mini-block of data.  When this happens
@@ -457,12 +645,7 @@ impl DecodeMiniBlockTask {
             .collect()
     }
 
-    // Unserialize a miniblock into a collection of vectors
-    fn decode_miniblock_chunk(
-        &self,
-        buf: &LanceBuffer,
-        items_in_chunk: u64,
-    ) -> Result<DecodedMiniBlockChunk> {
+    fn parse_miniblock_chunk(&self, buf: &LanceBuffer) -> ParsedMiniBlockChunk {
         let mut offset = 0;
         let num_levels = u16::from_le_bytes([buf[offset], buf[offset + 1]]);
         offset += 2;
@@ -514,35 +697,119 @@ impl DecodeMiniBlockTask {
             })
             .collect::<Vec<_>>();
 
+        ParsedMiniBlockChunk {
+            num_levels,
+            rep,
+            def,
+            values: buffers,
+        }
+    }
+
+    // Unserialize a miniblock into a collection of vectors
+    fn decode_miniblock_chunk(
+        &self,
+        buf: &LanceBuffer,
+        items_in_chunk: u64,
+    ) -> Result<DecodedMiniBlockChunk> {
+        let parsed = self.parse_miniblock_chunk(buf);
+
         let values = self
             .value_decompressor
-            .decompress(buffers, items_in_chunk)?;
+            .decompress(parsed.values, items_in_chunk)?;
 
-        let rep = rep
+        let rep = parsed
+            .rep
             .map(|rep| {
                 Self::decode_levels(
                     self.rep_decompressor.as_ref().unwrap().as_ref(),
                     rep,
-                    num_levels,
+                    parsed.num_levels,
                 )
             })
             .transpose()?;
-        let def = def
+        let def = parsed
+            .def
             .map(|def| {
                 Self::decode_levels(
                     self.def_decompressor.as_ref().unwrap().as_ref(),
                     def,
-                    num_levels,
+                    parsed.num_levels,
                 )
             })
             .transpose()?;
 
         Ok(DecodedMiniBlockChunk { rep, def, values })
     }
-}
 
-impl DecodePageTask for DecodeMiniBlockTask {
-    fn decode(self: Box<Self>) -> Result<DecodedPage> {
+    fn fixed_width_fast_path_bits(&self) -> Option<u64> {
+        if self.rep_decompressor.is_some()
+            || self.def_decompressor.is_some()
+            || self.dictionary_data.is_some()
+        {
+            return None;
+        }
+        match self.value_decompressor.fixed_width_output_bits_per_value() {
+            Some(bits @ (8 | 16 | 32 | 64)) => Some(bits),
+            _ => None,
+        }
+    }
+
+    fn decode_direct_fixed_width(self) -> Result<DecodedPage> {
+        let bits_per_value = self.fixed_width_fast_path_bits().ok_or_else(|| {
+            Error::internal(
+                "decode_direct_fixed_width called without a supported fixed-width fast path"
+                    .to_string(),
+            )
+        })?;
+        let total_values = self
+            .instructions
+            .iter()
+            .map(|(instructions, _)| instructions.rows_to_take as usize)
+            .sum::<usize>();
+        let mut output = DirectFixedWidthDecodeBuffer::with_capacity(bits_per_value, total_values)?;
+        let mut output_offset = 0usize;
+
+        for (instructions, chunk) in &self.instructions {
+            let row_range_start =
+                instructions.rows_to_skip + instructions.chunk_instructions.rows_to_skip;
+            let row_range_end = row_range_start + instructions.rows_to_take;
+            let item_range = row_range_start..row_range_end;
+            if item_range.end > chunk.items_in_chunk {
+                return Err(lance_core::Error::internal(format!(
+                    "Item range {:?} is greater than chunk items in chunk {:?}",
+                    item_range, chunk.items_in_chunk
+                )));
+            }
+
+            let parsed = self.parse_miniblock_chunk(&chunk.data);
+            let is_full_chunk = item_range.start == 0 && item_range.end == chunk.items_in_chunk;
+            let wrote_direct = if is_full_chunk {
+                output.try_decode_full_chunk(
+                    self.value_decompressor.as_ref(),
+                    &parsed.values,
+                    chunk.items_in_chunk,
+                    output_offset,
+                )?
+            } else {
+                false
+            };
+
+            if !wrote_direct {
+                let values = self
+                    .value_decompressor
+                    .decompress(parsed.values, chunk.items_in_chunk)?;
+                output.append_selection(values, item_range.clone(), output_offset)?;
+            }
+
+            output_offset += (item_range.end - item_range.start) as usize;
+        }
+
+        let data = output.into_data_block();
+        let repdef = RepDefUnraveler::new(None, None, self.def_meaning.clone(), data.num_values());
+        Ok(DecodedPage { data, repdef })
+    }
+
+    fn decode_generic(self) -> Result<DecodedPage> {
         // First, we create output buffers for the rep and def and data
         let mut repbuf: Option<LevelBuffer> = None;
         let mut defbuf: Option<LevelBuffer> = None;
@@ -648,6 +915,17 @@ impl DecodePageTask for DecodeMiniBlockTask {
             data,
             repdef: unraveler,
         })
+    }
+}
+
+impl DecodePageTask for DecodeMiniBlockTask {
+    fn decode(self: Box<Self>) -> Result<DecodedPage> {
+        let this = *self;
+        if this.fixed_width_fast_path_bits().is_some() {
+            this.decode_direct_fixed_width()
+        } else {
+            this.decode_generic()
+        }
     }
 }
 
@@ -2990,47 +3268,81 @@ struct FixedFullZipDecodeTask {
     bytes_per_value: usize,
 }
 
+impl FixedFullZipDecodeTask {
+    fn fixed_width_fast_path_bits(&self) -> Option<u64> {
+        if self.details.ctrl_word_parser.bytes_per_word() != 0 {
+            return None;
+        }
+        match self.details.value_decompressor {
+            PerValueDecompressor::Fixed(ref decompressor) => {
+                match decompressor.fixed_width_output_bits_per_value() {
+                    Some(bits @ (8 | 16 | 32 | 64)) => Some(bits),
+                    _ => None,
+                }
+            }
+            PerValueDecompressor::Variable(_) => None,
+        }
+    }
+}
+
 impl DecodePageTask for FixedFullZipDecodeTask {
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
-        // Multiply by 2 to make a stab at the size of the output buffer (which will be decompressed and thus bigger)
-        let estimated_size_bytes = self
-            .data
-            .iter()
-            .map(|task_item| task_item.data.data_size() as usize)
-            .sum::<usize>()
-            * 2;
-        let mut data_builder =
-            DataBlockBuilder::with_capacity_estimate(estimated_size_bytes as u64);
-
-        if self.details.ctrl_word_parser.bytes_per_word() == 0 {
+        if let Some(bits_per_value) = self.fixed_width_fast_path_bits() {
             // Fast path, no need to unzip because there is no rep/def
-            //
-            // We decompress each buffer and add it to our output buffer
+            // and the per-value decompressor can write primitive output directly.
+            let total_values = self
+                .data
+                .iter()
+                .map(|task_item| task_item.rows_in_buf as usize)
+                .sum::<usize>();
+            let mut output =
+                DirectFixedWidthDecodeBuffer::with_capacity(bits_per_value, total_values)?;
+            let PerValueDecompressor::Fixed(decompressor) = &self.details.value_decompressor else {
+                unreachable!()
+            };
+            let mut output_offset = 0usize;
+
             for task_item in self.data.into_iter() {
                 let PerValueDataBlock::Fixed(fixed_data) = task_item.data else {
                     unreachable!()
                 };
-                let PerValueDecompressor::Fixed(decompressor) = &self.details.value_decompressor
-                else {
-                    unreachable!()
-                };
                 debug_assert_eq!(fixed_data.num_values, task_item.rows_in_buf);
-                let decompressed = decompressor.decompress(fixed_data, task_item.rows_in_buf)?;
-                data_builder.append(&decompressed, 0..task_item.rows_in_buf);
+                let wrote_direct = output.try_decode_full_zip_buffer(
+                    decompressor.as_ref(),
+                    fixed_data,
+                    output_offset,
+                )?;
+                if !wrote_direct {
+                    return Err(Error::internal(
+                        "Fixed full-zip direct-write fast path was selected but the decompressor could not write directly".to_string(),
+                    ));
+                }
+                output_offset += task_item.rows_in_buf as usize;
             }
 
+            let data = output.into_data_block();
             let unraveler = RepDefUnraveler::new(
                 None,
                 None,
                 self.details.def_meaning.clone(),
-                self.num_rows as u64,
+                data.num_values(),
             );
 
             Ok(DecodedPage {
-                data: data_builder.finish(),
+                data,
                 repdef: unraveler,
             })
         } else {
+            // Multiply by 2 to make a stab at the size of the output buffer (which will be decompressed and thus bigger)
+            let estimated_size_bytes = self
+                .data
+                .iter()
+                .map(|task_item| task_item.data.data_size() as usize)
+                .sum::<usize>()
+                * 2;
+            let mut data_builder =
+                DataBlockBuilder::with_capacity_estimate(estimated_size_bytes as u64);
+
             // Slow path, unzipping needed
             let mut rep = Vec::with_capacity(self.num_rows);
             let mut def = Vec::with_capacity(self.num_rows);
@@ -3482,6 +3794,32 @@ pub struct StructuralCompositeDecodeArrayTask {
 }
 
 impl StructuralCompositeDecodeArrayTask {
+    fn primitive_fixed_width_assembly_bits(data_type: &DataType) -> Option<u64> {
+        match data_type {
+            DataType::Int32 | DataType::Int64 | DataType::UInt32 | DataType::UInt64 => {
+                Some(data_type.byte_width() as u64 * 8)
+            }
+            _ => None,
+        }
+    }
+
+    fn can_use_primitive_fixed_width_assembly(
+        decoded_pages: &[DecodedPage],
+        data_type: &DataType,
+    ) -> Option<u64> {
+        let expected_bits = Self::primitive_fixed_width_assembly_bits(data_type)?;
+        decoded_pages
+            .iter()
+            .all(|decoded| {
+                decoded.repdef.is_all_valid()
+                    && decoded
+                        .data
+                        .as_fixed_width_ref()
+                        .is_some_and(|fixed| fixed.bits_per_value == expected_bits)
+            })
+            .then_some(expected_bits)
+    }
+
     fn restore_validity(
         array: Arc<dyn Array>,
         unraveler: &mut CompositeRepDefUnraveler,
@@ -3509,24 +3847,50 @@ impl StructuralCompositeDecodeArrayTask {
 
 impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
     fn decode(self: Box<Self>) -> Result<DecodedArray> {
-        let mut arrays = Vec::with_capacity(self.tasks.len());
-        let mut unravelers = Vec::with_capacity(self.tasks.len());
         let mut data_size = 0u64;
+        let mut decoded_pages = Vec::with_capacity(self.tasks.len());
         for task in self.tasks {
             let decoded = task.decode()?;
             data_size += decoded.data.data_size();
-            unravelers.push(decoded.repdef);
-
-            let array = make_array(
-                decoded
-                    .data
-                    .into_arrow(self.data_type.clone(), self.should_validate)?,
-            );
-
-            arrays.push(array);
+            decoded_pages.push(decoded);
         }
-        let array_refs = arrays.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>();
-        let array = arrow_select::concat::concat(&array_refs)?;
+
+        let mut unravelers = Vec::with_capacity(decoded_pages.len());
+        let array = if let Some(bits_per_value) =
+            Self::can_use_primitive_fixed_width_assembly(&decoded_pages, &self.data_type)
+        {
+            let mut buffers = Vec::with_capacity(decoded_pages.len());
+            let mut num_values = 0;
+            for decoded in decoded_pages {
+                unravelers.push(decoded.repdef);
+                let fixed = decoded.data.as_fixed_width().expect(
+                    "primitive fixed-width assembly fast path should only run on fixed-width pages",
+                );
+                num_values += fixed.num_values;
+                buffers.push(fixed.data);
+            }
+            make_array(
+                DataBlock::FixedWidth(FixedWidthDataBlock {
+                    data: LanceBuffer::concat_into_one(buffers),
+                    bits_per_value,
+                    num_values,
+                    block_info: BlockInfo::new(),
+                })
+                .into_arrow(self.data_type.clone(), self.should_validate)?,
+            )
+        } else {
+            let mut arrays = Vec::with_capacity(decoded_pages.len());
+            for decoded in decoded_pages {
+                unravelers.push(decoded.repdef);
+                arrays.push(make_array(
+                    decoded
+                        .data
+                        .into_arrow(self.data_type.clone(), self.should_validate)?,
+                ));
+            }
+            let array_refs = arrays.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>();
+            arrow_select::concat::concat(&array_refs)?
+        };
         let mut repdef = CompositeRepDefUnraveler::new(unravelers);
 
         let array = Self::restore_validity(array, &mut repdef);
@@ -5398,29 +5762,32 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
 #[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::{
-        ChunkInstructions, DataBlock, DecodeMiniBlockTask, FixedPerValueDecompressor,
-        FixedWidthDataBlock, FullZipCacheableState, FullZipDecodeDetails, FullZipReadSource,
-        FullZipRepIndexDetails, FullZipScheduler, MiniBlockRepIndex, PerValueDecompressor,
-        PreambleAction, StructuralPageScheduler, VariableFullZipDecoder,
+        ChunkInstructions, DataBlock, DecodeMiniBlockTask, FixedFullZipDecodeTask,
+        FixedPerValueDecompressor, FixedWidthDataBlock, FullZipCacheableState,
+        FullZipDecodeDetails, FullZipDecodeTaskItem, FullZipReadSource, FullZipRepIndexDetails,
+        FullZipScheduler, MiniBlockRepIndex, PerValueDecompressor, PreambleAction,
+        StructuralCompositeDecodeArrayTask, StructuralPageScheduler, VariableFullZipDecoder,
     };
     use crate::buffer::LanceBuffer;
     use crate::compression::DefaultDecompressionStrategy;
     use crate::constants::{
-        COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, DICT_VALUES_COMPRESSION_LEVEL_META_KEY,
-        DICT_VALUES_COMPRESSION_META_KEY, STRUCTURAL_ENCODING_META_KEY,
+        BSS_META_KEY, COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, DELTA_RLE_META_KEY,
+        DICT_VALUES_COMPRESSION_LEVEL_META_KEY, DICT_VALUES_COMPRESSION_META_KEY,
+        RLE_THRESHOLD_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
         STRUCTURAL_ENCODING_MINIBLOCK,
     };
     use crate::data::BlockInfo;
-    use crate::decoder::PageEncoding;
+    use crate::decoder::{DecodePageTask, DecodedPage, PageEncoding, StructuralDecodeArrayTask};
     use crate::encodings::logical::primitive::{
-        ChunkDrainInstructions, PrimitiveStructuralEncoder,
+        ChunkDrainInstructions, PrimitiveStructuralEncoder, fullzip::PerValueDataBlock,
     };
     use crate::format::ProtobufUtils21;
     use crate::format::pb21;
     use crate::format::pb21::compressive_encoding::Compression;
+    use crate::repdef::{DefinitionInterpretation, RepDefUnraveler};
     use crate::testing::{TestCases, check_round_trip_encoding_of_data};
     use crate::version::LanceFileVersion;
-    use arrow_array::{ArrayRef, Int8Array, StringArray};
+    use arrow_array::{ArrayRef, Int8Array, StringArray, UInt32Array};
     use arrow_schema::DataType;
     use std::collections::HashMap;
     use std::{collections::VecDeque, sync::Arc};
@@ -6940,6 +7307,363 @@ mod tests {
             dictionary.dictionary_data_alignment,
             crate::encoder::MIN_PAGE_BUFFER_ALIGNMENT
         );
+    }
+
+    #[tokio::test]
+    async fn test_miniblock_bitpacking_direct_fixed_width_roundtrip() {
+        let values = (0..50_000)
+            .map(|idx| (idx % 1000) as u32)
+            .collect::<Vec<_>>();
+        let array = Arc::new(UInt32Array::from(values)) as ArrayRef;
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_MINIBLOCK.to_string(),
+        );
+        metadata.insert(RLE_THRESHOLD_META_KEY.to_string(), "0.0".to_string());
+        metadata.insert(BSS_META_KEY.to_string(), "off".to_string());
+        metadata.insert(DELTA_RLE_META_KEY.to_string(), "false".to_string());
+
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_2)
+            .with_batch_size(50_000);
+
+        check_round_trip_encoding_of_data(vec![array], &test_cases, metadata).await;
+    }
+
+    #[test]
+    fn test_fullzip_direct_fixed_width_decode_task_uses_direct_write() {
+        #[derive(Debug)]
+        struct DirectOnlyFixedDecompressor;
+
+        impl FixedPerValueDecompressor for DirectOnlyFixedDecompressor {
+            fn decompress(
+                &self,
+                _data: FixedWidthDataBlock,
+                _num_rows: u64,
+            ) -> crate::Result<DataBlock> {
+                panic!("fullzip direct-write test should not fall back to decompress + append");
+            }
+
+            fn bits_per_value(&self) -> u64 {
+                32
+            }
+
+            fn fixed_width_output_bits_per_value(&self) -> Option<u64> {
+                Some(32)
+            }
+
+            fn decompress_into_u32(
+                &self,
+                data: FixedWidthDataBlock,
+                destination: &mut [u32],
+            ) -> crate::Result<bool> {
+                let source = data.data.borrow_to_typed_slice::<u32>();
+                destination.copy_from_slice(source.as_ref());
+                Ok(true)
+            }
+        }
+
+        let block_a = FixedWidthDataBlock {
+            bits_per_value: 32,
+            data: LanceBuffer::reinterpret_vec(vec![1u32, 2, 3]),
+            num_values: 3,
+            block_info: BlockInfo::new(),
+        };
+        let block_b = FixedWidthDataBlock {
+            bits_per_value: 32,
+            data: LanceBuffer::reinterpret_vec(vec![4u32, 5]),
+            num_values: 2,
+            block_info: BlockInfo::new(),
+        };
+
+        let decoded = Box::new(FixedFullZipDecodeTask {
+            details: Arc::new(FullZipDecodeDetails {
+                value_decompressor: PerValueDecompressor::Fixed(Arc::new(
+                    DirectOnlyFixedDecompressor,
+                )),
+                def_meaning: Arc::new([crate::repdef::DefinitionInterpretation::AllValidItem]),
+                ctrl_word_parser: crate::repdef::ControlWordParser::new(0, 0),
+                max_rep: 0,
+                max_visible_def: 0,
+            }),
+            data: vec![
+                FullZipDecodeTaskItem {
+                    data: PerValueDataBlock::Fixed(block_a),
+                    rows_in_buf: 3,
+                },
+                FullZipDecodeTaskItem {
+                    data: PerValueDataBlock::Fixed(block_b),
+                    rows_in_buf: 2,
+                },
+            ],
+            num_rows: 5,
+            bytes_per_value: 4,
+        })
+        .decode()
+        .unwrap();
+
+        let fixed = decoded.data.as_fixed_width_ref().unwrap();
+        let values = fixed.data.borrow_to_typed_slice::<u32>();
+        assert_eq!(values.as_ref(), &[1, 2, 3, 4, 5]);
+        assert_eq!(fixed.num_values, 5);
+    }
+
+    struct StaticDecodedPageTask {
+        decoded: Option<DecodedPage>,
+    }
+
+    impl std::fmt::Debug for StaticDecodedPageTask {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("StaticDecodedPageTask")
+        }
+    }
+
+    impl DecodePageTask for StaticDecodedPageTask {
+        fn decode(mut self: Box<Self>) -> crate::Result<DecodedPage> {
+            Ok(self.decoded.take().unwrap())
+        }
+    }
+
+    fn all_valid_item_repdef(num_items: u64) -> RepDefUnraveler {
+        RepDefUnraveler::new(
+            None,
+            None,
+            Arc::new([DefinitionInterpretation::AllValidItem]),
+            num_items,
+        )
+    }
+
+    fn nullable_item_repdef(def_levels: Vec<u16>, num_items: u64) -> RepDefUnraveler {
+        RepDefUnraveler::new(
+            None,
+            Some(def_levels),
+            Arc::new([DefinitionInterpretation::NullableItem]),
+            num_items,
+        )
+    }
+
+    #[test]
+    fn test_can_use_primitive_fixed_width_assembly_for_all_valid_pages() {
+        let pages = vec![
+            DecodedPage {
+                data: DataBlock::FixedWidth(FixedWidthDataBlock {
+                    bits_per_value: 32,
+                    data: LanceBuffer::reinterpret_vec(vec![1_i32, 2, 3]),
+                    num_values: 3,
+                    block_info: BlockInfo::new(),
+                }),
+                repdef: all_valid_item_repdef(3),
+            },
+            DecodedPage {
+                data: DataBlock::FixedWidth(FixedWidthDataBlock {
+                    bits_per_value: 32,
+                    data: LanceBuffer::reinterpret_vec(vec![4_i32, 5]),
+                    num_values: 2,
+                    block_info: BlockInfo::new(),
+                }),
+                repdef: all_valid_item_repdef(2),
+            },
+        ];
+
+        assert_eq!(
+            StructuralCompositeDecodeArrayTask::can_use_primitive_fixed_width_assembly(
+                &pages,
+                &DataType::Int32,
+            ),
+            Some(32)
+        );
+    }
+
+    #[test]
+    fn test_can_not_use_primitive_fixed_width_assembly_when_validity_must_be_restored() {
+        let pages = vec![
+            DecodedPage {
+                data: DataBlock::FixedWidth(FixedWidthDataBlock {
+                    bits_per_value: 32,
+                    data: LanceBuffer::reinterpret_vec(vec![1_i32, 2, 3]),
+                    num_values: 3,
+                    block_info: BlockInfo::new(),
+                }),
+                repdef: nullable_item_repdef(vec![0, 1, 0], 3),
+            },
+            DecodedPage {
+                data: DataBlock::FixedWidth(FixedWidthDataBlock {
+                    bits_per_value: 32,
+                    data: LanceBuffer::reinterpret_vec(vec![4_i32, 5]),
+                    num_values: 2,
+                    block_info: BlockInfo::new(),
+                }),
+                repdef: all_valid_item_repdef(2),
+            },
+        ];
+
+        assert_eq!(
+            StructuralCompositeDecodeArrayTask::can_use_primitive_fixed_width_assembly(
+                &pages,
+                &DataType::Int32,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_structural_composite_decode_array_task_restores_validity_across_pages() {
+        let task = Box::new(StructuralCompositeDecodeArrayTask {
+            tasks: vec![
+                Box::new(StaticDecodedPageTask {
+                    decoded: Some(DecodedPage {
+                        data: DataBlock::FixedWidth(FixedWidthDataBlock {
+                            bits_per_value: 32,
+                            data: LanceBuffer::reinterpret_vec(vec![10_i32, 20, 30]),
+                            num_values: 3,
+                            block_info: BlockInfo::new(),
+                        }),
+                        repdef: nullable_item_repdef(vec![0, 1, 0], 3),
+                    }),
+                }),
+                Box::new(StaticDecodedPageTask {
+                    decoded: Some(DecodedPage {
+                        data: DataBlock::FixedWidth(FixedWidthDataBlock {
+                            bits_per_value: 32,
+                            data: LanceBuffer::reinterpret_vec(vec![40_i32, 50]),
+                            num_values: 2,
+                            block_info: BlockInfo::new(),
+                        }),
+                        repdef: nullable_item_repdef(vec![1, 0], 2),
+                    }),
+                }),
+            ],
+            should_validate: true,
+            data_type: DataType::Int32,
+        })
+        .decode()
+        .unwrap();
+
+        let array = task
+            .array
+            .as_any()
+            .downcast_ref::<arrow_array::Int32Array>()
+            .unwrap();
+        assert_eq!(
+            array.iter().collect::<Vec<_>>(),
+            vec![Some(10), None, Some(30), None, Some(50)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fullzip_direct_fixed_width_roundtrip() {
+        let values = (0..50_000)
+            .map(|idx| (idx % 1000) as u32)
+            .collect::<Vec<_>>();
+        let array = Arc::new(UInt32Array::from(values)) as ArrayRef;
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_FULLZIP.to_string(),
+        );
+
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_2)
+            .with_batch_size(50_000)
+            .with_page_sizes(vec![4096]);
+
+        check_round_trip_encoding_of_data(vec![array], &test_cases, metadata).await;
+    }
+
+    #[tokio::test]
+    async fn test_multi_page_list_roundtrip_after_primitive_fixed_width_assembly() {
+        let list_array =
+            arrow_array::ListArray::from_iter_primitive::<arrow_array::types::Int32Type, _, _>(
+                (0..2048).map(|i| match i % 6 {
+                    0 => Some(vec![Some(i as i32), None, Some((i + 1) as i32)]),
+                    1 => Some(vec![]),
+                    2 => None,
+                    3 => Some(vec![Some((i * 2) as i32)]),
+                    _ => Some(vec![None, Some((i * 3) as i32)]),
+                }),
+            );
+
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_2)
+            .with_batch_size(128)
+            .with_page_sizes(vec![256]);
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(list_array) as ArrayRef],
+            &test_cases,
+            HashMap::new(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_multi_page_fixed_size_list_roundtrip_after_primitive_fixed_width_assembly() {
+        let list_array = arrow_array::FixedSizeListArray::from_iter_primitive::<
+            arrow_array::types::Int32Type,
+            _,
+            _,
+        >(
+            (0..2048).map(|i| {
+                if i % 5 == 0 {
+                    None
+                } else {
+                    Some(vec![
+                        Some(i as i32),
+                        if i % 3 == 0 {
+                            None
+                        } else {
+                            Some((i + 1) as i32)
+                        },
+                        Some((i + 2) as i32),
+                    ])
+                }
+            }),
+            3,
+        );
+
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_2)
+            .with_batch_size(128)
+            .with_page_sizes(vec![256]);
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(list_array) as ArrayRef],
+            &test_cases,
+            HashMap::new(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_multi_page_struct_roundtrip_after_primitive_fixed_width_assembly() {
+        let struct_array = arrow_array::StructArray::from(vec![
+            (
+                Arc::new(arrow_schema::Field::new("a", DataType::Int32, true)),
+                Arc::new(arrow_array::Int32Array::from(
+                    (0..2048)
+                        .map(|i| if i % 4 == 0 { None } else { Some(i as i32) })
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ),
+            (
+                Arc::new(arrow_schema::Field::new("b", DataType::UInt32, false)),
+                Arc::new(UInt32Array::from(
+                    (0..2048).map(|i| (i % 97) as u32).collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ),
+        ]);
+
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_2)
+            .with_batch_size(128)
+            .with_page_sizes(vec![256]);
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(struct_array) as ArrayRef],
+            &test_cases,
+            HashMap::new(),
+        )
+        .await;
     }
 
     // Dictionary encoding decision tests
